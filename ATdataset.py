@@ -135,27 +135,26 @@ class FbankExtractor(torch.nn.Module):
         return mel
 
 
-def _simple_filter_keys(sample, exts=("wav", "flac", "mp3")):
-    return any(k in sample for k in exts)
+def _simple_filter_keys(sample, audio_formats=("wav", "flac", "mp3")):
+    return any(k in sample for k in audio_formats)
 
 
 def _simple_decode_audio(
-    sample, exts=("wav", "flac", "mp3"), sample_rate=16000, device="cpu"
+    sample, audio_formats=("wav", "flac", "mp3"), sample_rate=16000
 ):
-    for ext in exts:
+    for ext in audio_formats:
         if ext in sample:
-            return load_audio(sample[ext], sample_rate=sample_rate, device=device)
+            return load_audio(sample[ext], sample_rate=sample_rate)
     raise RuntimeError("No noise audio found in sample")
 
 
 def create_simple_audio_dataset(
     audio_tars: List[str],
     sample_rate: int = 16000,
-    exts: Tuple[str] = ("wav", "flac", "mp3"),
     buffer_size: int = 1000,
-    nodesplitter: Optional[Any] = None,
-    workersplitter: Optional[Any] = None,
-    device: str = "cpu",
+    nodesplitter: Optional[Any] = wds.split_by_node,
+    workersplitter: Optional[Any] = wds.split_by_worker,
+    audio_formats: Tuple[str] = ("wav", "flac", "mp3"),
 ):
     """
     Create a simple audio dataset from webdataset tar files.
@@ -164,24 +163,22 @@ def create_simple_audio_dataset(
         List of audio tar files.
       sample_rate:
         Target sample rate for audio.
-      exts:
-        Tuple of audio file extensions to look for in the sample.
       buffer_size:
         Buffer size for shuffling.
       nodesplitter:
         Node splitter for webdataset.
       workersplitter:
         Worker splitter for webdataset.
-      device:
-        Device to load audio tensors.
+      audio_formats:
+        Tuple of audio file extensions to look for in the sample.
     """
 
-    simple_filter_keys = partial(_simple_filter_keys, exts=exts)
+    simple_filter_keys = partial(_simple_filter_keys, audio_formats=audio_formats)
     simple_decode_audio = partial(
-        _simple_decode_audio, exts=exts, sample_rate=sample_rate, device=device
+        _simple_decode_audio,
+        audio_formats=audio_formats,
+        sample_rate=sample_rate,
     )
-
-    audio_tars = list(audio_tars)
     audio_ds = (
         wds.WebDataset(
             audio_tars,
@@ -234,7 +231,7 @@ class LabelDataset:
           manifest_path:
             Path to the manifest file containing labels.
             Each line in the manifest file is in the format of:
-            {"key": "unique_key", "text": "transcription text"}
+            {"audio_filepath": "filepath.{wav,mp3,flac}", "text": "transcription text"}
         """
         self._labels = {}
 
@@ -256,46 +253,36 @@ class LabelDataset:
                     self._labels[key] = item["text"]
 
     def __getitem__(self, key):
-        if key not in self._labels:
-            return "<|empty|>"
+        if key not in self._labels or not self._labels[key].strip():
+            return "<|EMPTY|>"
         return self._labels[key]
 
 
 class SampleDecoder:
     """
     Decode a sample from webdataset, including loading audio and fetching label.
-    And also apply augmentations if needed.
+    The returned audio is a tensor of shape (1, num_samples) on CPU.
     """
 
     def __init__(
         self,
-        config: Dict,
         labels_to_audios: Dict,
         sample_rate: int = 16000,
-        is_train: bool = True,
-        audio_ext: Tuple[str] = ("flac", "wav", "mp3"),
-        device: torch.device = torch.device("cpu"),
+        audio_format: Tuple[str] = ("flac", "wav", "mp3"),
     ):
         """
         Args:
-          config:
-            A dict containing configuration for data loading and augmentation.
           labels_to_audios:
             A dict mapping from audio tar file to label tar file.
           sample_rate:
             Target sample rate for audio.
-          is_train:
-            Whether the dataset is for training or not.
-          audio_ext:
+          audio_format:
             Tuple of audio file extensions to look for in the sample.
         """
-        self.config = config
         self.labels = labels_to_audios
         self.sample_rate = sample_rate
         self.label_dataset = None
-        self.audio_ext = audio_ext
-        self.is_train = is_train
-        self.device = device
+        self.audio_format = audio_format
 
     def __call__(self, sample):
         sample = fix_sample_key(sample)
@@ -305,43 +292,56 @@ class SampleDecoder:
             logging.info(f"Loading labels from {self.labels[src]}")
             self.label_dataset = LabelDataset(self.labels[src])
 
-        audio = torch.empty(0, device=self.device)
-        for ext in self.audio_ext:
+        audio = torch.empty(0)
+        for ext in self.audio_format:
             if ext in sample:
                 # load audio (1, num_samples)
-                audio = load_audio(
-                    sample[ext], sample_rate=self.sample_rate, device=self.device
-                )
+                audio = load_audio(sample[ext], sample_rate=self.sample_rate)
                 break
-
-        # apply speed perturbation
-        if (
-            self.is_train
-            and self.config.get("speed_perturb", False)
-            and audio.numel() > 0
-        ):
-            speed = random.choice(self.config["speed_perturb"])
-            if speed != 1:
-                audio = torchaudio.functional.resample(
-                    audio, self.sample_rate, int(self.sample_rate * speed)
-                )
-
-        # apply volume perturbation
-        if (
-            self.is_train
-            and self.config.get("volume_perturb", False)
-            and audio.numel() > 0
-        ):
-            prob, lower_db, upper_db = self.config["volume_perturb"]
-            if random.random() <= prob:
-                gain_db = random.uniform(lower_db, upper_db)
-                audio = audio * (10 ** (gain_db / 20))
 
         label = self.label_dataset[key]
         return {
             "audio": audio,
             "label": label,
         }
+
+
+def audio_augmentation(
+    audio,
+    sample_rate: int = 16000,
+    speed_perturb: Optional[Tuple] = (0.9, 1.0, 1.1),  # speeds
+    volume_perturb: Optional[Tuple] = (0.5, -10, 6),  # prob, lower_db, upper_db
+):
+    """
+    Apply speed and volume perturbation to the audio tensor.
+    Args:
+      audio:
+        Audio tensor of shape (1, num_samples).
+      sample_rate:
+        Sample rate of the audio.
+      speed_perturb:
+        Tuple of speeds for speed perturbation.
+      volume_perturb:
+        Tuple of (probability, lower_db, upper_db) for volume perturbation.
+    Returns:
+      The augmented audio tensor.
+    """
+    # apply speed perturbation
+    if speed_perturb is not None and audio.numel() > 0:
+        assert isinstance(speed_perturb, (list, tuple))
+        speed = random.choice(speed_perturb)
+        if speed != 1:
+            audio = torchaudio.functional.resample(
+                audio, sample_rate, int(sample_rate * speed)
+            )
+
+    # apply volume perturbation
+    if volume_perturb is not None and audio.numel() > 0:
+        prob, lower_db, upper_db = volume_perturb
+        if random.random() <= prob:
+            gain_db = random.uniform(lower_db, upper_db)
+            audio = audio * (10 ** (gain_db / 20))
+    return audio
 
 
 def augment_with_noise(audio, noise_sampler, lower_snr_db, upper_snr_db, is_train=True):
@@ -414,14 +414,26 @@ class StreamingBucketBatcher:
             * (self.num_buckets - 1)
         )
 
-    def __call__(self, data_stream):
-        stream = iter(data_stream)
+    def __call__(
+        self, data_streams: List[wds.WebDataset], weights: Optional[List[float]] = None
+    ):
+        if weights is None:
+            weights = [1.0 / len(data_streams)] * len(data_streams)
+        else:
+            total = sum(weights)
+            weights = [w / total for w in weights]
+        streams = [iter(data_stream) for data_stream in data_streams]
+        stream_idx = 0
+
+        logging.info("Starting StreamingBucketBatching with weights:", weights)
+
         while True:
             # Fill buckets
             full_buckets = []
             try:
                 while True:
-                    sample = next(stream)
+                    stream_idx = np.random.choice(len(streams), p=weights)
+                    sample = next(streams[stream_idx])
                     length = sample[self.length_key].size(1) / self.sample_rate
                     b_id = self.bucket_id(length)
                     self.buckets[b_id].append(sample)
@@ -430,7 +442,7 @@ class StreamingBucketBatcher:
                         i
                         for i in range(self.num_buckets)
                         if self.bucket_item_lengths[i] * len(self.buckets[i])
-                        > self.max_duration * 1.25
+                        > self.max_duration * 1.5
                     ]
                     if full_buckets:
                         break
@@ -438,7 +450,7 @@ class StreamingBucketBatcher:
             except StopIteration:
                 if self.is_train:
                     # repeat the data stream, the StreamingWebDataset will handle epoch ending
-                    stream = iter(data_stream)
+                    streams[stream_idx] = iter(data_streams[stream_idx])
                     continue
 
             batch = []
@@ -483,17 +495,40 @@ class StreamingBucketBatcher:
             yield batch
 
 
+def get_manifest_duration(manifest_path: str) -> float:
+    """
+    Calculate total duration of audio files in a manifest file.
+    Args:
+      manifest_path:
+        Path to the manifest file containing audio file paths and durations.
+        Each line in the manifest file is in the format of:
+        {"audio_filepath": path, "text": text, "duration": duration_in_seconds}
+    """
+    total_duration = 0.0
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if "duration" in item:
+                total_duration += float(item["duration"])
+    return total_duration
+
+
 class StreamingWebDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
-        audio_tars: List[str],
-        labels_to_audios: Dict,
-        config: Dict,
+        manifests: Union[str, List[str]],
         sample_rate: int = 16000,
         max_duration: float = 1000.0,
-        epoch_hours: float = 1000.0,
+        epoch_hours: Optional[float] = None,
+        mux_weights: Optional[List[float]] = None,
         feature_extractor: Optional[Callable] = None,
         noise_tars: Optional[List[str]] = None,
+        noise_augment: Tuple = (0.5, 10, 20),  # probs lower_snr_db, upper_snr_db
+        speed_perturb: Tuple = (0.9, 1.0, 1.1),  # speeds
+        volume_perturb: Tuple = (0.5, -10, 6),  # prob, lower_db, upper_db
         buffer_size: int = 1000,
         is_train: bool = True,
         device=torch.device("cpu"),
@@ -501,69 +536,196 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         """
         Streaming webdataset for ASR training with dynamic bucketing batching.
         Args:
-          audio_tars:
-            List of audio tar files.
-          labels_to_audios:
-            A dict mapping from audio tar file to label tar file.
-          config:
-            A dict containing configuration for data loading and augmentation.
+          manifests:
+            A list of manifest files containing audio tar files and label files.
           sample_rate:
             Target sample rate for audio.
           max_duration:
             Maximum duration (in seconds) for each batch.
+          epoch_hours:
+            Number of hours per epoch. If None, will calculate based on manifest durations.
+          mux_weights:
+            A list of weights for each manifest for muxing.
           feature_extractor:
             Feature extractor to extract features from raw audio.
           noise_tars:
             List of noise tar files for noise augmentation.
+          noise_augment:
+            Tuple of (probability, lower_snr_db, upper_snr_db) for noise augmentation.
+          speed_perturb:
+            Tuple of speeds for speed perturbation.
+          volume_perturb:
+            Tuple of (probability, lower_db, upper_db) for volume perturbation.
           buffer_size:
             Buffer size for shuffling.
           is_train:
             Whether the dataset is for training or not.
+          device:
+            Device to calculate features.
         """
         super().__init__()
 
         self.device = device
         self.is_train = is_train
         self.buffer_size = buffer_size
-        self.audio_tars = audio_tars
         self.max_duration = max_duration
 
-        # noise_sampler for noise augmentation
-        noise_sampler = None
-        if noise_tars is not None and config.get("noise_augment", False) and is_train:
-            noise_ds = create_simple_audio_dataset(
-                noise_tars,
-                sample_rate=sample_rate,
-                buffer_size=buffer_size,
-                workersplitter=wds.split_by_worker,
-            )
-            noise_sampler = NoiseSampler(noise_ds)
+        if isinstance(manifests, str):
+            assert os.path.exists(
+                manifests
+            ), f"Manifest file {manifests} does not exist."
+            self.manifests = [manifests]
+        else:
+            assert isinstance(
+                manifests, list
+            ), "manifests should be a string or a list of strings."
+            for manifest in manifests:
+                assert os.path.exists(
+                    manifest
+                ), f"Manifest file {manifest} does not exist."
+            self.manifests = manifests
+
+        nodes = 1 if not dist.is_initialized() else dist.get_world_size()
+        workers = 1 if get_worker_info() is None else get_worker_info().num_workers
+        self.num_workers = workers * nodes
+
+        # we share all labels_to_audios among all manifests for simplicity
+        labels_to_audios: Dict[str, str] = {}
+        audio_tars_lists: List[List[str]] = []
+        manifest_durations: List[float] = []
+        for manifest in self.manifests:
+            manifest_audio_tars: List[str] = []
+            manifest_duration = 0.0
+            log_duration_warning = True  # to avoid too many warnings
+            with open(manifest, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    items = line.split()
+                    if len(items) < 2:
+                        logging.warning(
+                            f"Each line in manifest file {manifest} should contain "
+                            f"at least 2 fields: audio_tar label_json \n"
+                            f"skipping line: {line}"
+                        )
+                        continue
+                    if (not os.path.exists(items[0])) or (not os.path.exists(items[1])):
+                        logging.warning(
+                            f"Either audio tar file {items[0]} or label file "
+                            f"{items[1]} does not exist, skipping line : {line}."
+                        )
+                        continue
+                    if len(items) < 3:
+                        if log_duration_warning:
+                            logging.warning(
+                                f"Manifest file {manifest} does not contain duration "
+                                f"field, calculating duration from manifests, might be slow."
+                                f" Please consider adding duration field to the manifest file."
+                            )
+                            log_duration_warning = False
+                        manifest_duration += get_manifest_duration(items[1]) / 3600.0
+                    else:
+                        manifest_duration += float(items[2])
+                    manifest_audio_tars.append(items[0])
+                    labels_to_audios[items[0]] = items[1]
+
+            if manifest_duration <= 0.001:
+                logging.warning(
+                    f"Manifest {manifest} has very small duration : {manifest_duration}, "
+                    f"please check if the manifest files are correct, especially the duration field."
+                )
+            logging.info(f"Manifest {manifest} duration: {manifest_duration:.2f} hours")
+            audio_tars_lists.append(manifest_audio_tars)
+            manifest_durations.append(manifest_duration)
+
+        self.audio_tars_lists = []
+        # pad audio_tars to be multiple of num_workers (for proper sharding)
+        for audio_tars in audio_tars_lists:
+            tar_indexs = list(range(len(audio_tars)))
+            pad_num = self.num_workers - (len(audio_tars) % self.num_workers)
+            for i in range(pad_num):
+                audio_tars.append(audio_tars[random.choice(tar_indexs)])
+            self.audio_tars_lists.append(audio_tars)
+
+        calculated_hours = sum(manifest_durations)
+        if epoch_hours is None:
+            logging.info(f"Using calculated epoch hours: {calculated_hours:.2f}")
+            epoch_hours = calculated_hours
+        else:
+            if abs(calculated_hours - epoch_hours) / epoch_hours > 0.05:
+                logging.warning(
+                    f"Given epoch hours {epoch_hours} differ from calculated "
+                    f"hours {calculated_hours:.2f} by more than 5%. "
+                    f"Using given epoch hours, but you may want to double check."
+                )
+
+        calculated_mux_weights = [
+            round(dur / calculated_hours, 2) for dur in manifest_durations
+        ]
+        if mux_weights is None and len(self.manifests) > 1:
+            logging.info(f"Using calculated mux weights: {calculated_mux_weights}")
+            mux_weights = calculated_mux_weights
+        else:
+            if mux_weights is not None:
+                mux_weights_sum = sum(mux_weights)
+                mux_weights = [round(w / mux_weights_sum, 2) for w in mux_weights]
+                if any(
+                    abs(mux_weights[i] - calculated_mux_weights[i])
+                    / calculated_mux_weights[i]
+                    > 0.05
+                    for i in range(len(mux_weights))
+                ):
+                    logging.warning(
+                        f"Given mux weights {mux_weights} differ from calculated "
+                        f"weights {calculated_mux_weights} by more than 5%. "
+                        f"Using given mux weights, but you may want to double check."
+                    )
+            else:
+                logging.info("Only one manifest, no mux weights needed.")
+                mux_weights = [1]
+
+        self.epoch_batches = math.ceil(
+            epoch_hours * 3600.0 / (self.num_workers) / max_duration
+        )
+        self.mux_weights = mux_weights
 
         # sample_decoder is to decode audio and assign label
         self.sample_decoder = SampleDecoder(
             labels_to_audios=labels_to_audios,
-            config=config,
             sample_rate=sample_rate,
-            is_train=is_train,
         )
 
-        nodes = 1 if not dist.is_initialized() else dist.get_world_size()
-        workers = 1 if get_worker_info() is None else get_worker_info().num_workers
-        self.epoch_batches = math.ceil(
-            epoch_hours * 3600.0 / (nodes * workers) / max_duration
-        )
+        # noise_sampler for noise augmentation
+        noise_sampler = None
+        if noise_tars is not None and noise_augment is not None and is_train:
+            noise_tars = list(noise_tars)
+            tar_indexs = list(range(len(noise_tars)))
+            pad_num = self.num_workers - (len(noise_tars) % self.num_workers)
+            for i in range(pad_num):
+                noise_tars.append(noise_tars[random.choice(tar_indexs)])
+            noise_ds = create_simple_audio_dataset(
+                noise_tars,
+                sample_rate=sample_rate,
+                buffer_size=buffer_size,
+                nodesplitter=wds.split_by_node,
+                workersplitter=wds.split_by_worker,
+            )
+            noise_sampler = NoiseSampler(noise_ds)
 
         self.num_copies = 1
         self.noise_prob = 0.0
         lower_snr_db = 10.0
         upper_snr_db = 20.0
-        if (
-            is_train
-            and config.get("noise_augment", False)
-            and noise_sampler is not None
-        ):
+        if is_train and noise_augment is not None and noise_sampler is not None:
+            assert (
+                isinstance(noise_augment, (list, tuple)) and len(noise_augment) == 3
+            ), (
+                "noise_augment should be a tuple of "
+                "(probability, lower_snr_db, upper_snr_db)"
+            )
             self.num_copies = 3
-            self.noise_prob, lower_snr_db, upper_snr_db = config["noise_augment"]
+            self.noise_prob, lower_snr_db, upper_snr_db = noise_augment
 
         self.add_noise = partial(
             augment_with_noise,
@@ -572,21 +734,29 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
             upper_snr_db=upper_snr_db,
             is_train=is_train,
         )
+        self.augment_audio = partial(
+            audio_augmentation,
+            sample_rate=sample_rate,
+            speed_perturb=speed_perturb,
+            volume_perturb=volume_perturb,
+        )
+
         self.sample_rate = sample_rate
         self.feature_extractor = feature_extractor.to(device)
 
     def __iter__(self):
         # read raw audio data and label
-        dataset = (
+        datasets = [
             wds.WebDataset(
-                self.audio_tars,
-                shardshuffle=len(self.audio_tars) if self.is_train else False,
+                audio_tars,
+                shardshuffle=len(audio_tars) if self.is_train else False,
                 nodesplitter=wds.split_by_node,
             )
             .decode()
             .map(self.sample_decoder)
             .shuffle(self.buffer_size if self.is_train else 1)
-        )
+            for audio_tars in self.audio_tars_lists
+        ]
 
         # for dynamic batching based on audio duration with max_duration
         batcher = StreamingBucketBatcher(
@@ -594,10 +764,8 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
             sample_rate=self.sample_rate,
             is_train=self.is_train,
         )
-        dataset = batcher(dataset)
-
+        dataset = batcher(datasets, weights=self.mux_weights)
         self.stream = iter(dataset)
-
         batch_count = 0
 
         while True:
@@ -619,7 +787,9 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
 
                 for sample in raw_batch:
                     # sample["audio"]: (1, num_samples)
-                    audio = sample["audio"].squeeze(0)
+                    audio = self.augment_audio(sample["audio"])
+                    # remove the channel dimension for batching
+                    audio = audio.squeeze(0)
                     label = sample["label"]
                     key = sample["__key__"]
                     audio_len = audio.size(0)
@@ -685,8 +855,9 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
                 del audios, audio_lens
                 if features is not None:
                     del features, frame_lens
-                torch.cuda.synchronize(self.device)
-                torch.cuda.empty_cache()
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                    torch.cuda.empty_cache()
 
                 batch_output = {
                     "inputs": audios_cpu,
@@ -716,19 +887,21 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
                     return
                 self.stream = iter(dataset)
             except RuntimeError as e:
-                logging.error(f"Runtime error in data loading: {e}")
+                logging.error(f"Runtime error in data loading: {e}, skipping batch.")
                 continue
 
 
 def create_dataloader(
-    audio_tars: List[str],
-    labels_to_audios: Dict,
-    config: Dict,
+    manifests: Union[str, List[str]],
     sample_rate: int = 16000,
     max_duration: float = 600.0,
-    epoch_hours: float = 1000,
+    epoch_hours: Optional[float] = None,
+    mux_weights: Optional[List[float]] = None,
     feature_extractor: Optional[Callable] = None,
     noise_tars: Optional[List[str]] = None,
+    noise_augment: Tuple = (0.5, 10, 20),  # probs lower_snr_db, upper_snr_db
+    speed_perturb: Tuple = (0.9, 1.0, 1.1),  # speeds
+    volume_perturb: Tuple = (0.5, -10, 6),  # prob, lower_db, upper_db
     buffer_size: int = 1000,
     num_workers: int = 2,
     is_train: bool = True,
@@ -737,36 +910,46 @@ def create_dataloader(
     """
     Create a dataloader for streaming webdataset.
     Args:
-      audio_tars:
-        List of audio tar files.
-      labels_to_audios:
-        A dict mapping from audio tar file to label tar file.
-      config:
-        A dict containing configuration for data loading and augmentation.
+      manifests:
+        A list of manifest files containing audio tar files and label files.
       sample_rate:
         Target sample rate for audio.
       max_duration:
         Maximum duration (in seconds) for each batch.
+      epoch_hours:
+        Number of hours per epoch. If None, will calculate based on manifest durations.
+      mux_weights:
+        A list of weights for each manifest for muxing, If None, will calculate based on manifest durations.
       feature_extractor:
         Feature extractor to extract features from raw audio.
       noise_tars:
         List of noise tar files for noise augmentation.
+      noise_augment:
+        Tuple of (probability, lower_snr_db, upper_snr_db) for noise augmentation.
+      speed_perturb:
+        Tuple of speeds for speed perturbation.
+      volume_perturb:
+        Tuple of (probability, lower_db, upper_db) for volume perturbation.
       buffer_size:
         Buffer size for shuffling.
       num_workers:
         Number of workers for dataloader.
       is_train:
         Whether the dataloader is for training or not.
+      device:
+        Device to calculate features.
     """
     dataset = StreamingWebDataset(
-        audio_tars=audio_tars,
-        labels_to_audios=labels_to_audios,
-        config=config,
+        manifests=manifests,
+        mux_weights=mux_weights,
         sample_rate=sample_rate,
         max_duration=max_duration,
         epoch_hours=epoch_hours,
         feature_extractor=feature_extractor,
         noise_tars=noise_tars,
+        noise_augment=noise_augment,
+        speed_perturb=speed_perturb,
+        volume_perturb=volume_perturb,
         buffer_size=buffer_size,
         is_train=is_train,
         device=device,
@@ -781,43 +964,29 @@ def create_dataloader(
 
 
 def main():
-    audio_tars = glob.glob("data/tars/audios/librispeech_train-clean-360.*.tar")
-    annot_tars = glob.glob("data/tars/txts/librispeech_train-clean-360.*.tar")
+    feature_extractor = FbankExtractor(sample_rate=16000)
     noise_tars = glob.glob("data/musan/audios/musan.*.tar")
 
-    audio_tars.sort()
-    annot_tars.sort()
-
-    labels = {}
-    for x, y in zip(audio_tars, annot_tars):
-        labels[x] = y
-
-    config = {
-        "noise_augment": (0.5, 10, 20),  # lower_snr_db, upper_snr_db
-        "speed_perturb": (0.9, 1.0, 1.1),  # speeds
-        "volume_perturb": (0.5, -10, 6),  # prob, lower_db, upper_db
-        "sample_rate": 16000,
-        "device": "cuda:0",
-    }
-
-    feature_extractor = FbankExtractor(
-        sample_rate=config.get("sample_rate", 16000),
-        device=config.get("device", "cpu"),
-    )
-
     dataset = create_dataloader(
-        audio_tars=audio_tars,
-        labels_to_audios=labels,
-        max_duration=1000.0,
-        epoch_hours=360,
+        manifests=[
+            "data/tars/aishell_train.lst",
+            "data/tars/librispeech_train.lst",
+            "data/tars/gigaspeech_XL.lst",
+            "data/tars/wenetspeech_L.lst",
+        ],
+        max_duration=200.0,
+        epoch_hours=None,
+        mux_weights=None,
         feature_extractor=feature_extractor,
-        sample_rate=config.get("sample_rate", 16000),
-        config=config,
+        sample_rate=16000,
         noise_tars=noise_tars,
+        noise_augment=(0.5, 10, 20),
+        speed_perturb=(0.9, 1.0, 1.1),
+        volume_perturb=(0.5, -10, 6),
         buffer_size=1000,
         is_train=True,
-        num_workers=4,
-        device=torch.device(config.get("device", "cpu")),
+        num_workers=2,
+        device=torch.device("cuda"),
     )
 
     start = time.time()
@@ -832,6 +1001,10 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     try:
