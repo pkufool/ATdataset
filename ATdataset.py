@@ -365,7 +365,8 @@ class StreamingBucketBatcher:
 
     def __init__(
         self,
-        max_duration: float = 500.0,  # in seconds
+        max_duration: float,  # in seconds
+        max_samples: Optional[int] = None,
         min_length: float = 1,  # in seconds
         max_length: float = 30,  # in seconds
         num_buckets: int = 30,
@@ -391,6 +392,7 @@ class StreamingBucketBatcher:
             Key in the sample dict to use for length calculation.
         """
         self.max_duration = max_duration
+        self.max_samples = max_samples
         self.num_buckets = num_buckets
         self.min_length = min_length
         self.max_length = max_length
@@ -425,7 +427,7 @@ class StreamingBucketBatcher:
         streams = [iter(data_stream) for data_stream in data_streams]
         stream_idx = 0
 
-        logging.info("Starting StreamingBucketBatching with weights:", weights)
+        logging.info(f"Starting StreamingBucketBatching with weights: {weights}")
 
         while True:
             # Fill buckets
@@ -435,6 +437,8 @@ class StreamingBucketBatcher:
                     stream_idx = np.random.choice(len(streams), p=weights)
                     sample = next(streams[stream_idx])
                     length = sample[self.length_key].size(1) / self.sample_rate
+                    if length < self.min_length or length > self.max_length:
+                        continue
                     b_id = self.bucket_id(length)
                     self.buckets[b_id].append(sample)
 
@@ -469,19 +473,31 @@ class StreamingBucketBatcher:
                     bucket_range.reverse()
 
             last_b_id = bucket_range[0] if bucket_range else None
+            num_samples = 0
+            max_sample_length = 0
             for b_id in bucket_range:
                 while self.buckets[b_id]:
+                    if num_samples >= self.max_samples:
+                        break
                     sample = self.buckets[b_id][0]
                     length = sample[self.length_key].size(1) / self.sample_rate
-                    if batch_duration + length > self.max_duration:
+                    tmp_max_sample_length = max(max_sample_length, length)
+                    if tmp_max_sample_length * (num_samples + 1) > self.max_duration:
                         if not batch:
                             last_b_id = b_id
-                            batch_duration += length  # for break the for loop
+                            # for break the outer for loop
+                            max_sample_length = length
+                            num_samples = 1
                         break
                     else:
                         batch.append(self.buckets[b_id].popleft())
-                        batch_duration += length
-                if batch_duration >= self.max_duration:
+                        if length > max_sample_length:
+                            max_sample_length = length
+                        num_samples += 1
+                if (
+                    max_sample_length * num_samples >= self.max_duration
+                    or num_samples >= self.max_samples
+                ):
                     break
 
             if not batch:
@@ -522,6 +538,7 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         manifests: Union[str, List[str]],
         sample_rate: int,
         max_duration: float,
+        max_samples: Optional[int] = None,
         epoch_hours: Optional[float] = None,
         mux_weights: Optional[List[float]] = None,
         feature_extractor: Optional[Callable] = None,
@@ -569,6 +586,7 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         self.is_train = is_train
         self.buffer_size = buffer_size
         self.max_duration = max_duration
+        self.max_samples = max_samples
 
         if isinstance(manifests, str):
             assert os.path.exists(
@@ -685,7 +703,6 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
                 mux_weights = [1]
 
         self.epoch_hours = epoch_hours
-
         self.mux_weights = mux_weights
 
         # sample_decoder is to decode audio and assign label
@@ -718,7 +735,7 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         self.noise_prob = 0.0
         self.lower_snr_db = 10.0
         self.upper_snr_db = 20.0
-        if is_train and noise_augment is not None:
+        if is_train and noise_augment is not None and self.noise_tars is not None:
             assert (
                 isinstance(noise_augment, (list, tuple)) and len(noise_augment) == 3
             ), (
@@ -736,7 +753,9 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         )
 
         self.sample_rate = sample_rate
-        self.feature_extractor = feature_extractor.to(device)
+        if feature_extractor is not None:
+            feature_extractor = feature_extractor.to(device)
+        self.feature_extractor = feature_extractor
 
     # __iter__ runs on child process, while __init__ runs on main process
     def __iter__(self):
@@ -747,7 +766,7 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         if self.noise_tars:
             tar_indexs = list(range(len(self.noise_tars)))
             pad_num = total_num_workers - (len(self.noise_tars) % total_num_workers)
-            if pad_num != len(self.noise_tars):
+            if pad_num != total_num_workers:
                 for i in range(pad_num):
                     self.noise_tars.append(self.noise_tars[random.choice(tar_indexs)])
             noise_ds = create_simple_audio_dataset(
@@ -771,7 +790,7 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         for audio_tars in self.audio_tars_lists:
             tar_indexs = list(range(len(audio_tars)))
             pad_num = total_num_workers - (len(audio_tars) % total_num_workers)
-            if pad_num != len(audio_tars):
+            if pad_num != total_num_workers:
                 for i in range(pad_num):
                     audio_tars.append(audio_tars[random.choice(tar_indexs)])
 
@@ -791,6 +810,7 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         # for dynamic batching based on audio duration with max_duration
         batcher = StreamingBucketBatcher(
             max_duration=self.max_duration,
+            max_samples=self.max_samples,
             sample_rate=self.sample_rate,
             is_train=self.is_train,
         )
@@ -932,6 +952,7 @@ def create_dataloader(
     manifests: Union[str, List[str]],
     sample_rate: int,
     max_duration: float = 600.0,
+    max_samples: Optional[int] = None,
     epoch_hours: Optional[float] = None,
     mux_weights: Optional[List[float]] = None,
     feature_extractor: Optional[Callable] = None,
@@ -981,6 +1002,7 @@ def create_dataloader(
         mux_weights=mux_weights,
         sample_rate=sample_rate,
         max_duration=max_duration,
+        max_samples=max_samples,
         epoch_hours=epoch_hours,
         feature_extractor=feature_extractor,
         noise_manifest=noise_manifest,
@@ -1006,16 +1028,16 @@ def main():
     mux_weights = [1350, 2000, 3000, 10000, 10000]
     dataset = create_dataloader(
         manifests=[
-            "data/tars/aishell2_dev.lst"
-            # "data/tars/aishell_train.lst",
-            # "data/tars/aishell2_train.lst",
-            # "data/tars/librispeech_train.lst",
-            # "data/tars/gigaspeech_XL.lst",
-            # "data/tars/wenetspeech_L.lst",
+            "data/tars/aishell_train.lst",
+            "data/tars/aishell2_train.lst",
+            "data/tars/librispeech_train.lst",
+            "data/tars/gigaspeech_XL.lst",
+            "data/tars/wenetspeech_L.lst",
         ],
-        max_duration=20.0,
-        # epoch_hours=sum(mux_weights),
-        # mux_weights=mux_weights,
+        max_duration=200.0,
+        max_samples=3,
+        epoch_hours=sum(mux_weights),
+        mux_weights=mux_weights,
         feature_extractor=feature_extractor,
         sample_rate=16000,
         noise_manifest="data/tars/musan.lst",
