@@ -1147,9 +1147,7 @@ class ATDataloader(wds.WebLoader):
             device=device,
         )
 
-        self.epoch_batches = dataset.epoch_batches_per_node // max(
-            num_workers, 1
-        )
+        self.epoch_batches = dataset.epoch_batches_per_node
 
         super().__init__(
             dataset,
@@ -1168,9 +1166,7 @@ class ATDataloader(wds.WebLoader):
 
 
 def filter_func(sample):
-    return True
     if sample["audio"].size(1) < 16000 * 5:
-        print("filtering short audio:", sample["__key__"])
         return False
     return True
 
@@ -1188,19 +1184,19 @@ def main():
         manifests=[
             "data/tars/aishell_train.lst",
             "data/tars/aishell2_train.lst",
-            # "data/tars/librispeech_train.lst",
-            # "data/tars/gigaspeech_XL.lst",
-            # "data/tars/wenetspeech_L.lst",
+            "data/tars/librispeech_train.lst",
+            "data/tars/gigaspeech_XL.lst",
+            "data/tars/wenetspeech_L.lst",
         ],
         max_duration=2000.0,
-        # max_samples=3,
-        # epoch_hours=sum(mux_weights),
-        # mux_weights=mux_weights,
+        max_samples=2000,
+        epoch_hours=sum(mux_weights),
+        mux_weights=mux_weights,
         feature_extractor=None,
         filter_func=None,
         map_func=None,
         sample_rate=16000,
-        # noise_manifest="data/tars/musan.lst",
+        noise_manifest="data/tars/musan.lst",
         noise_augment=(0.5, 10, 20),
         speed_perturb=(0.9, 1.0, 1.1),
         volume_perturb=(0.5, -10, 6),
@@ -1213,13 +1209,7 @@ def main():
 
     start = time.time()
     for i, batch in enumerate(tqdm(dataset, total=len(dataset))):
-        # print(
-        # batch["inputs"].shape,
-        # batch["supervisions"]["num_frames"].min().item(),
-        # batch["supervisions"]["num_frames"].max().item(),
-        # time.time() - start,
-        # )
-        start = time.time()
+        pass
 
 
 if __name__ == "__main__":
