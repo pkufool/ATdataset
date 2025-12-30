@@ -467,13 +467,9 @@ class StreamingBucketBatcher:
                     sample = next(streams[stream_idx])
                     length = sample[self.length_key].size(1) / self.sample_rate
 
-                    if length < self.min_length or length > self.max_length:
-                        if self.is_test:
-                            logging.warning(
-                                f"Sample {sample['__key__']} length {length:.2f} "
-                                f"is filtered out by min_length or max_length "
-                                f"[{self.min_length}, {self.max_length}], skipping."
-                            )
+                    if not self.is_test and (
+                        length < self.min_length or length > self.max_length
+                    ):
                         continue
                     if self.filter_func is not None:
                         if not self.filter_func(sample):
