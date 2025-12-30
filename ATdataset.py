@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright    2025  Xiaomi Corp.        (authors:  Wei Kang,
+# Copyright    2025  Xiaomi Corp.        (authors:  Wei Kang)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -67,7 +67,7 @@ def load_audio(data, sample_rate: int = 16000, device="cpu"):
     audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
     audio = torch.tensor(audio, device=device)
     if audio.size(1) > 1:
-        audio = torch.mean(audio, dim=1)
+        audio = torch.mean(audio, dim=1, keepdim=True)
     audio = audio.permute(1, 0)
     if sr != sample_rate:
         audio = torchaudio.functional.resample(audio, sr, sample_rate)
@@ -851,6 +851,8 @@ class StreamingWebDataset(torch.utils.data.IterableDataset):
         self.sample_rate = sample_rate
         if feature_extractor is not None:
             feature_extractor = feature_extractor.to(device)
+        else:
+            self.device = "cpu"
         self.feature_extractor = feature_extractor
 
     # __iter__ runs on child process, while __init__ runs on main process
