@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atdataset"
+version = "0.1.0"
+description = "Audio text dataset for PyTorch training based on webdataset."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Wei Kang" }]
+dependencies = [
+  "torch>=1.13",
+  "torchaudio>=0.13",
+  "webdataset>=0.2.86",
+  "soundfile>=0.12",
+  "numpy>=1.21",
+]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.setuptools]
+py-modules = ["ATdataset", "feature"]
+include-package-data = true
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+include = ["atdataset*"]
