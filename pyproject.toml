@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atdataset"
-version = "0.1.0"
+version = "0.1.1"
 description = "Audio text dataset for PyTorch training based on webdataset."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
-authors = [{ name = "Wei Kang" }]
+license = {text = "Apache-2.0"}
+authors = [{ name = "pkufool" }]
 dependencies = [
   "torch>=1.13",
   "torchaudio>=0.13",
   "webdataset>=0.2.86",
-  "soundfile>=0.12",
+  "soundfile>=0.13",
   "numpy>=1.21",
 ]
 classifiers = [
@@ -30,9 +30,7 @@ classifiers = [
 ]
 
 [tool.setuptools]
-py-modules = ["ATdataset", "feature"]
 include-package-data = true
-license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
-include = ["atdataset*"]
+include = ["atdataset"]
