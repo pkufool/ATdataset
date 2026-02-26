@@ -41,8 +41,8 @@ def map_func(sample, sp):
 
 def worker_init_fn(worker_id):
     logging.basicConfig(
-        level=logging.WARNING,
-        format="%(asctime)s %(processName)s %(levelname)s %(message)s",
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s [%(pathname)s:%(lineno)d] %(message)s",
     )
 
 
@@ -86,7 +86,7 @@ def main():
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(asctime)s %(levelname)-8s [%(pathname)s:%(lineno)d] %(message)s",
     )
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
