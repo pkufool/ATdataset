@@ -45,6 +45,17 @@ class FbankExtractor(torch.nn.Module):
         self.n_mels = n_mels
         self.hop_length = hop_length
 
+    def __repr__(self):
+        return (
+            f"FbankExtractor(sample_rate={self.sample_rate}, "
+            f"n_fft={self.fbank.n_fft}, "
+            f"hop_length={self.hop_length}, "
+            f"n_mels={self.n_mels})"
+        )
+
+    def __str__(self):
+        return self.__repr__()
+
     @property
     def frame_shift(self) -> float:
         return self.hop_length / self.sample_rate

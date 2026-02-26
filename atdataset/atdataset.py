@@ -377,12 +377,18 @@ class ATDataset(torch.utils.data.IterableDataset):
                 A function to filter samples. It takes a sample dict as input and returns a boolean.
             map_func:
                 A function to map samples. It takes a sample dict as input and returns a modified sample dict.
-            noise_manifest:
-                The filepath containing noise audio tars.
+            use_noise_augment:
+                Whether to apply noise augmentation.
             noise_augment:
                 Tuple of (probability, lower_snr_db, upper_snr_db) for noise augmentation.
+            noise_manifest:
+                The filepath containing noise audio tars.
+            use_speed_perturb:
+                Whether to apply speed perturbation.
             speed_perturb:
                 Tuple of speeds for speed perturbation.
+            use_volume_perturb:
+                Whether to apply volume perturbation.
             volume_perturb:
                 Tuple of (probability, lower_db, upper_db) for volume perturbation.
             feature_extractor:
@@ -402,8 +408,12 @@ class ATDataset(torch.utils.data.IterableDataset):
         self.min_length = min_length
         self.max_length = max_length
         self.use_noise_augment = use_noise_augment
+        self.noise_manifest = noise_manifest
+        self.noise_augment = noise_augment
         self.use_speed_perturb = use_speed_perturb
+        self.speed_perturb = speed_perturb
         self.use_volume_perturb = use_volume_perturb
+        self.volume_perturb = volume_perturb
 
         assert os.path.exists(manifest), f"Manifest file {manifest} does not exist."
         self.manifest = manifest
@@ -519,7 +529,9 @@ class ATDataset(torch.utils.data.IterableDataset):
         self.augment_audio = partial(
             audio_augmentation,
             sample_rate=sample_rate,
+            use_speed_perturb=use_speed_perturb,
             speed_perturb=speed_perturb,
+            use_volume_perturb=use_volume_perturb,
             volume_perturb=volume_perturb,
         )
 
@@ -529,6 +541,22 @@ class ATDataset(torch.utils.data.IterableDataset):
         else:
             self.device = "cpu"
         self.feature_extractor = feature_extractor
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __repr__(self):
+        return (
+            f"ATDataset(manifest={self.manifest}, sample_rate={self.sample_rate}, "
+            f"duration_hours={self.duration_hours:.2f}, buffer_size={self.buffer_size}, "
+            f"min_length={self.min_length:.2f}, max_length={self.max_length:.2f}, "
+            f"use_speed_perturb={self.use_speed_perturb}, speed_perturb={self.speed_perturb}, "
+            f"use_volume_perturb={self.use_volume_perturb}, volume_perturb={self.volume_perturb}, "
+            f"use_noise_augment={self.use_noise_augment}, noise_augment={self.noise_augment}, "
+            f"noise_manifest={self.noise_manifest}, feature_extractor={self.feature_extractor}, "
+            f"filter_func={self.filter_func}, map_func={self.map_func}, "
+            f"is_test={self.is_test}, device={self.device})"
+        )
 
     # __iter__ runs on child process, while __init__ runs on main process
     def __iter__(self):
@@ -652,8 +680,8 @@ class StreamingBucketBatcher:
         weights: List[float],
         sample_rate: int = 16000,
         max_samples: Optional[int] = None,
-        min_length: float = 0.1,  # in seconds
-        max_length: float = 30,  # in seconds
+        min_length: Union[float, List[float]] = 0.1,  # in seconds
+        max_length: Union[float, List[float]] = 30,  # in seconds
         num_buckets: int = 30,
         mux_intra_batch: bool = True,
         is_test: bool = False,
@@ -663,6 +691,10 @@ class StreamingBucketBatcher:
         Args:
           max_duration:
             Maximum duration (in seconds) for each batch.
+          weights:
+            List of weights for each dataset stream.
+          sample_rate:
+            Sample rate of the audio samples.
           max_samples:
             Maximum number of samples for each batch.
           min_length:
@@ -671,8 +703,6 @@ class StreamingBucketBatcher:
             Maximum length (in seconds) of samples to consider.
           num_buckets:
             Number of buckets to use.
-          sample_rate:
-            Sample rate of the audio samples.
           mux_intra_batch:
             Whether to mix samples from different datasets within the same batch.
           is_test:
@@ -716,13 +746,13 @@ class StreamingBucketBatcher:
             ]
             self.bucket_item_lengths = []
             assert (
-                isinstance(self.min_lengths, list)
-                and isinstance(self.max_lengths, list)
-                and len(self.min_lengths) == len(self.max_lengths) == len(weights)
+                isinstance(self.min_length, list)
+                and isinstance(self.max_length, list)
+                and len(self.min_length) == len(self.max_length) == len(weights)
             ), f"When mux_intra_batch is False, min_length and max_length should be lists with the same length as weights."
             for i in range(len(weights)):
-                min_length = self.min_lengths[i]
-                max_length = self.max_lengths[i]
+                min_length = self.min_length[i]
+                max_length = self.max_length[i]
                 self.bucket_item_lengths.append(
                     [
                         math.ceil((max_length - max(1, min_length)) / num_buckets)
@@ -780,8 +810,8 @@ class StreamingBucketBatcher:
                         length = sample[self.length_key].size(1) / self.sample_rate
                         b_id = self.bucket_id(
                             length,
-                            self.min_lengths[stream_idx],
-                            self.max_lengths[stream_idx],
+                            self.min_length[stream_idx],
+                            self.max_length[stream_idx],
                         )
                         self.buckets[stream_idx][b_id].append(sample)
             except StopIteration:
@@ -862,6 +892,35 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         num_buckets: int = 30,
         device: torch.device = torch.device("cpu"),
     ):
+        """
+        Batched dataset that combines multiple ATDatasets with streaming bucketing and optional intra-batch muxing.
+
+        Args:
+          datasets:
+            An ATDataset or a list of ATDatasets to combine.
+          sample_rate:
+            Sample rate of the audio samples.
+          max_duration:
+            Maximum duration (in seconds) for each batch.
+          max_samples:
+            Maximum number of samples for each batch.
+          epoch_hours:
+            Total hours of audio to process in one epoch.
+            If None, will use the sum of durations of the datasets.
+          mux_weights:
+            List of weights for each dataset stream.
+            If None, will use the duration-based weights.
+          num_copies:
+            Number of copies of the sample to return in one batch. Default is 1.
+          mux_intra_batch:
+            Whether to mix samples from different datasets within the same batch. Default is True.
+          is_test:
+            Whether the dataset is for training or not. Default is False.
+          num_buckets:
+            Number of buckets to use for streaming bucketing. Default is 30.
+          device:
+            Device to calculate features. Default is CPU.
+        """
         super().__init__()
         self.sample_rate = sample_rate
         self.max_duration = max_duration
@@ -943,6 +1002,18 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             self.epoch_hours * 3600.0 / world_size / self.max_duration
         )
 
+    def __str__(self):
+        return self.__repr__()
+
+    def __repr__(self):
+        return (
+            f"BatchedDataset(sample_rate={self.sample_rate}, max_duration={self.max_duration}, "
+            f"max_samples={self.max_samples}, epoch_hours={self.epoch_hours:.2f}, "
+            f"mux_weights={self.mux_weights}, num_copies={1}, mux_intra_batch={self.mux_intra_batch}, "
+            f"is_test={self.is_test}, num_buckets={self.num_buckets}, device={self.device}, "
+            f"datasets={self.datasets})"
+        )
+
     def __iter__(self):
         rank, world_size, worker, num_workers = pytorch_worker_info()
 
@@ -987,6 +1058,9 @@ class BatchedDataset(torch.utils.data.IterableDataset):
                         raw_batch_output["audio"].append(v.squeeze(0))
                     elif k == "feature":
                         raw_batch_output["feature"].append(v.squeeze(0).transpose(0, 1))
+                    elif k == "__key__":
+                        raw_batch_output["ids"].append(v)
+                        raw_batch_output[k].append(v)
                     else:
                         raw_batch_output[k].append(v)
 
@@ -1059,7 +1133,9 @@ class ATDataloader(wds.WebLoader):
         device: torch.device = torch.device("cpu"),
     ):
         """
-        Create a dataloader for streaming webdataset.
+        Create a dataloader for streaming webdataset that supports multiple datasets with
+        different muxing strategies and bucketing for variable length audio samples.
+
         Args:
             datasets:
                 A single manifest path, ATDataset, or a list mixing both. String entries are
@@ -1069,40 +1145,62 @@ class ATDataloader(wds.WebLoader):
             max_duration:
                 Maximum duration (in seconds) for each batch.
             max_samples:
-                Maximum number of samples for each batch.
+                Maximum number of samples for each batch, used together with max_duration
+                to control batch size.
             epoch_hours:
                 Number of hours per epoch. If None, will calculate based on manifest durations.
             mux_weights:
-                A list of weights for each dataset for muxing. If None, uniform weights are used.
+                A list of weights for each dataset for muxing. If None, will calculate
+                based on dataset durations.
             min_length:
-                Minimum length (in seconds) of samples to consider.
+                Minimum length (in seconds) of samples to consider, used when creating datasets
+                from string manifests.
             max_length:
-                Maximum length (in seconds) of samples to consider.
-            feature_extractor:
-                Feature extractor to extract features from raw audio.
+                Maximum length (in seconds) of samples to consider, used when creating datasets
+                from string manifests.
             filter_func:
-                Function to filter samples when creating datasets from string manifests.
+                Function to filter samples, used when creating datasets from string manifests.
             map_func:
-                Function to map samples when creating datasets from string manifests.
+                Function to map samples, used when creating datasets from string manifests.
+            feature_extractor:
+                Feature extractor to extract features from raw audio, used when creating datasets
+                from string manifests.
+            use_noise_augment:
+                Whether to use noise augmentation, used when creating datasets from string manifests.
             noise_manifest:
-                The filepath containing noise audio tars (used when creating datasets from strings).
+                The filepath containing noise audio tars, used when creating datasets from strings manifests.
             noise_augment:
-                Tuple of (probability, lower_snr_db, upper_snr_db) for noise augmentation.
+                Tuple of (probability, lower_snr_db, upper_snr_db) for noise augmentation,
+                used when creating datasets from string manifests.
+            use_speed_perturb:
+                Whether to use speed perturbation, used when creating datasets from string manifests.
             speed_perturb:
-                Tuple of speeds for speed perturbation.
+                Tuple of speeds for speed perturbation, used when creating datasets from string manifests.
+            use_speed_perturb:
+                Whether to use volume perturbation, used when creating datasets from string manifests.
             volume_perturb:
-                Tuple of (probability, lower_db, upper_db) for volume perturbation.
+                Tuple of (probability, lower_db, upper_db) for volume perturbation, used when
+                creating datasets from string manifests.
+            num_copies:
+                Number of copies of the samples to return, used when creating datasets from string manifests.
             buffer_size:
-                Buffer size for shuffling.
+                Buffer size for shuffling, used when creating datasets from string manifests.
             num_workers:
                 Number of workers for dataloader.
+            worker_init_fn:
+                Worker init function for dataloader.
+            prefetch_factor:
+                Prefetch factor for dataloader, used when num_workers > 0.
+            num_buckets:
+                Number of buckets for bucketing variable length audio samples.
             is_test:
-                Whether the dataloader is for training or not.
-            device:
-                Device to calculate features.
+                Whether the dataloader is for testing or not, for training and validation, set is_test to False
+                to enable shuffling and data augmentation.
             mux_intra_batch:
                 If True, mux at sample level (intra-batch). If False, mux per batch.
-                Bucketing happens after mux so both modes are supported.
+            device:
+                Device to calculate features and doing augmentation, used when creating datasets from string manifests.
+                Note: All returned tensors will be on CPU, the device is only used for intermediate calculation.
         """
 
         if not isinstance(datasets, list):
@@ -1151,16 +1249,28 @@ class ATDataloader(wds.WebLoader):
             device=device,
         )
 
+        self.dataset = batched_dataset
         self.epoch_batches = batched_dataset.epoch_batches_per_node
+        self.num_workers = num_workers if not is_test else 0
+        self.prefetch_factor = prefetch_factor if num_workers > 0 else None
 
         super().__init__(
             batched_dataset,
             batch_size=None,
-            num_workers=num_workers,
+            num_workers=self.num_workers,
             shuffle=False,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            prefetch_factor=self.prefetch_factor,
             worker_init_fn=worker_init_fn,
         )
+
+    def __repr__(self):
+        return (
+            f"ATDataloader(dataset={self.dataset}, length={self.epoch_batches}, "
+            f"num_workers={self.num_workers}, prefetch_factor={self.prefetch_factor})"
+        )
+
+    def __str__(self):
+        return self.__repr__()
 
     def __len__(self):
         return self.epoch_batches

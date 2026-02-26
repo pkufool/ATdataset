@@ -48,7 +48,7 @@ def worker_init_fn(worker_id):
 
 def main():
     feature_extractor = FbankExtractor(sample_rate=16000)
-    mux_weights = [1350, 2000]
+    mux_weights = [350, 200]
     sp = Ssentencepiece("librispeech-500")
     _map_func = partial(map_func, sp=sp)
     dataset = ATDataloader(
@@ -60,6 +60,7 @@ def main():
         max_samples=200,
         epoch_hours=sum(mux_weights),
         mux_weights=mux_weights,
+        mux_intra_batch=True,
         feature_extractor=feature_extractor,
         filter_func=filter_func,
         map_func=_map_func,
@@ -74,11 +75,11 @@ def main():
         device=torch.device("cpu"),
     )
 
+    logging.info(f"Dataloader initialized: {dataset}.")
+
     start = time.time()
     for i, batch in enumerate(tqdm(dataset, total=len(dataset))):
-        print(
-            f"Batch {i}: audio shape={batch['audio'].shape}, feature shape={batch['feature'].shape}, keys : {batch.keys()}"
-        )
+        # logging.info(f"Batch {i}: ids={batch['ids']}")
         pass
 
 
