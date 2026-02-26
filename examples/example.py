@@ -51,7 +51,7 @@ def main():
     mux_weights = [350, 200]
     sp = Ssentencepiece("librispeech-500")
     _map_func = partial(map_func, sp=sp)
-    dataset = ATDataloader(
+    dl = ATDataloader(
         datasets=[
             "data/tars/aishell_train.lst",
             "data/tars/aishell2_train.lst",
@@ -75,10 +75,10 @@ def main():
         device=torch.device("cpu"),
     )
 
-    logging.info(f"Dataloader initialized: {dataset}.")
+    logging.info(f"Dataloader initialized: {dl}.")
 
     start = time.time()
-    for i, batch in enumerate(tqdm(dataset, total=len(dataset))):
+    for i, batch in enumerate(tqdm(dl, total=len(dl))):
         # logging.info(f"Batch {i}: ids={batch['ids']}")
         pass
 

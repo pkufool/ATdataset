@@ -7,10 +7,7 @@ Audio text dataset for pytorch training based on webdataset.
 pip install atdataset
 ```
 
-## Build and upload
+## Usage
 
-```bash
-python -m pip install --upgrade build twine
-python -m build
-python -m twine upload dist/*
-```
+see examples/example.py for more details.
+
