@@ -34,3 +34,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["atdataset"]
+
+[tool.black]
+line-length = 88
