@@ -335,13 +335,12 @@ class SampleDecoder:
                 audio = load_audio(sample[ext], sample_rate=self.sample_rate)
                 break
 
-        label = self.label_dataset[key]
+        text = self.label_dataset[key]
         sample["audio"] = audio
-        sample["label"] = label
+        sample["text"] = text
         return sample
 
 
-# TODO: support num_copies > 1
 class ATDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
@@ -358,7 +357,9 @@ class ATDataset(torch.utils.data.IterableDataset):
         speed_perturb: Tuple = (0.9, 1.0, 1.1),  # speeds
         use_volume_perturb: bool = True,
         volume_perturb: Tuple = (0.5, -10, 6),  # prob, lower_db, upper_db
+        feature_type: Optional[str] = "fbank",
         feature_extractor: Optional[Callable] = None,
+        num_copies: int = 1,
         buffer_size: int = 1000,
         is_test: bool = False,
         device=torch.device("cpu"),
@@ -393,6 +394,8 @@ class ATDataset(torch.utils.data.IterableDataset):
                 Tuple of (probability, lower_db, upper_db) for volume perturbation.
             feature_extractor:
                 Feature extractor to extract features from raw audio.
+            num_copies:
+                Number of copies of samples in one batch with different augmentations.
             buffer_size:
                 Buffer size for shuffling.
             is_test:
@@ -414,6 +417,7 @@ class ATDataset(torch.utils.data.IterableDataset):
         self.speed_perturb = speed_perturb
         self.use_volume_perturb = use_volume_perturb
         self.volume_perturb = volume_perturb
+        self.num_copies = num_copies
 
         assert os.path.exists(manifest), f"Manifest file {manifest} does not exist."
         self.manifest = manifest
@@ -496,9 +500,9 @@ class ATDataset(torch.utils.data.IterableDataset):
                 f"noise augmentation will be disabled."
             )
         if use_noise_augment and noise_manifest is not None and not is_test:
-            assert os.path.exists(
-                noise_manifest
-            ), f"Noise manifest {noise_manifest} does not exist."
+            assert os.path.exists(noise_manifest), (
+                f"Noise manifest {noise_manifest} does not exist."
+            )
             noise_tars = []
             with open(noise_manifest, "r", encoding="utf-8") as f:
                 for line in f:
@@ -554,7 +558,7 @@ class ATDataset(torch.utils.data.IterableDataset):
             f"use_volume_perturb={self.use_volume_perturb}, volume_perturb={self.volume_perturb}, "
             f"use_noise_augment={self.use_noise_augment}, noise_augment={self.noise_augment}, "
             f"noise_manifest={self.noise_manifest}, feature_extractor={self.feature_extractor}, "
-            f"filter_func={self.filter_func}, map_func={self.map_func}, "
+            f"filter_func={self.filter_func}, map_func={self.map_func}, num_copies={self.num_copies}, "
             f"is_test={self.is_test}, device={self.device})"
         )
 
@@ -649,23 +653,26 @@ class ATDataset(torch.utils.data.IterableDataset):
                         )
                     continue
 
-            audio = sample["audio"]
-            if not self.is_test:
-                audio = self.augment_audio(audio)
+            samples = []
+            for _ in range(self.num_copies):
+                sample_copy = copy.deepcopy(sample)
+                audio = sample["audio"]
+                if not self.is_test:
+                    audio = self.augment_audio(audio)
+                if not self.is_test and random.random() < self.noise_prob:
+                    audio = self.add_noise(audio)
+                sample_copy["audio"] = audio
 
-            if not self.is_test and random.random() < self.noise_prob:
-                audio = self.add_noise(audio)
-            sample["audio"] = audio
-
-            feature = None
-            if self.feature_extractor is not None:
-                with torch.no_grad():
-                    feature = self.feature_extractor(
-                        audio.to(self.device), sample_rate=self.sample_rate
-                    ).cpu()
-            if feature is not None:
-                sample["feature"] = feature
-            yield sample
+                feature = None
+                if self.feature_extractor is not None:
+                    with torch.no_grad():
+                        feature = self.feature_extractor(
+                            audio.to(self.device), sample_rate=self.sample_rate
+                        ).cpu()
+                if feature is not None:
+                    sample_copy["feature"] = feature
+                samples.append(sample_copy)
+            yield samples if self.num_copies > 1 else samples[0]
 
 
 class StreamingBucketBatcher:
@@ -730,7 +737,9 @@ class StreamingBucketBatcher:
                 )
             assert isinstance(min_length, (int, float)) and isinstance(
                 max_length, (int, float)
-            ), f"When mux_intra_batch is True, min_length and max_length should be single float values."
+            ), (
+                f"When mux_intra_batch is True, min_length and max_length should be single float values."
+            )
             self.buckets = collections.defaultdict(collections.deque)
             self.bucket_item_lengths = [
                 math.ceil((max_length - max(1, min_length)) / num_buckets) * (i + 1)
@@ -749,7 +758,9 @@ class StreamingBucketBatcher:
                 isinstance(self.min_length, list)
                 and isinstance(self.max_length, list)
                 and len(self.min_length) == len(self.max_length) == len(weights)
-            ), f"When mux_intra_batch is False, min_length and max_length should be lists with the same length as weights."
+            ), (
+                f"When mux_intra_batch is False, min_length and max_length should be lists with the same length as weights."
+            )
             for i in range(len(weights)):
                 min_length = self.min_length[i]
                 max_length = self.max_length[i]
@@ -790,10 +801,14 @@ class StreamingBucketBatcher:
                         if full_buckets:
                             break
                         stream_idx = np.random.choice(len(streams), p=weights)
-                        sample = next(streams[stream_idx])
+                        samples = next(streams[stream_idx])
+                        if isinstance(samples, list):
+                            sample = samples[0]
+                        else:
+                            sample = samples
                         length = sample[self.length_key].size(1) / self.sample_rate
                         b_id = self.bucket_id(length, self.min_length, self.max_length)
-                        self.buckets[b_id].append(sample)
+                        self.buckets[b_id].append(samples)
                 else:
                     stream_idx = np.random.choice(len(streams), p=weights)
                     while True:
@@ -806,14 +821,18 @@ class StreamingBucketBatcher:
                         ]
                         if full_buckets:
                             break
-                        sample = next(streams[stream_idx])
+                        samples = next(streams[stream_idx])
+                        if isinstance(samples, list):
+                            sample = samples[0]
+                        else:
+                            sample = samples
                         length = sample[self.length_key].size(1) / self.sample_rate
                         b_id = self.bucket_id(
                             length,
                             self.min_length[stream_idx],
                             self.max_length[stream_idx],
                         )
-                        self.buckets[stream_idx][b_id].append(sample)
+                        self.buckets[stream_idx][b_id].append(samples)
             except StopIteration:
                 if not self.is_test:
                     # repeat the data stream, the BatchedDataset will handle epoch ending
@@ -845,7 +864,11 @@ class StreamingBucketBatcher:
                 while buckets[b_id]:
                     if num_samples >= self.max_samples:
                         break
-                    sample = buckets[b_id][0]
+                    samples = buckets[b_id][0]
+                    if isinstance(samples, list):
+                        sample = samples[0]
+                    else:
+                        sample = samples
                     length = sample[self.length_key].size(1) / self.sample_rate
                     tmp_max_sample_length = max(max_sample_length, length)
                     if tmp_max_sample_length * (num_samples + 1) > self.max_duration:
@@ -886,8 +909,8 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         max_samples: Optional[int] = None,
         epoch_hours: Optional[float] = None,
         mux_weights: Optional[List[float]] = None,
-        num_copies: int = 1,
         mux_intra_batch: bool = True,
+        num_copies: int = 1,
         is_test: bool = False,
         num_buckets: int = 30,
         device: torch.device = torch.device("cpu"),
@@ -928,6 +951,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         self.is_test = is_test
         self.num_buckets = num_buckets
         self.mux_intra_batch = mux_intra_batch
+        self.num_copies = num_copies
         self.device = device
 
         if isinstance(datasets, ATDataset):
@@ -1009,7 +1033,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         return (
             f"BatchedDataset(sample_rate={self.sample_rate}, max_duration={self.max_duration}, "
             f"max_samples={self.max_samples}, epoch_hours={self.epoch_hours:.2f}, "
-            f"mux_weights={self.mux_weights}, num_copies={1}, mux_intra_batch={self.mux_intra_batch}, "
+            f"mux_weights={self.mux_weights}, num_copies={self.num_copies}, mux_intra_batch={self.mux_intra_batch}, "
             f"is_test={self.is_test}, num_buckets={self.num_buckets}, device={self.device}, "
             f"datasets={self.datasets})"
         )
@@ -1044,25 +1068,33 @@ class BatchedDataset(torch.utils.data.IterableDataset):
                 return
 
             raw_batch_output = collections.defaultdict(list)
-            for sample in raw_batch:
-                assert (
-                    "audio" in sample
-                ), "Each sample should contain 'audio' key after decoding."
-                if sample["audio"].numel() == 0:
-                    logging.warning(
-                        f"Sample {sample['__key__']} has empty audio after decoding, skipping."
+            for i in range(self.num_copies):
+                for sample in raw_batch:
+                    if isinstance(sample, list):
+                        assert len(sample) == self.num_copies, (
+                            f"Expected sample list of length {self.num_copies}, but got {len(sample)}"
+                        )
+                        sample = sample[i]
+                    assert "audio" in sample, (
+                        "Each sample should contain 'audio' key after decoding."
                     )
-                    continue
-                for k, v in sample.items():
-                    if k == "audio":
-                        raw_batch_output["audio"].append(v.squeeze(0))
-                    elif k == "feature":
-                        raw_batch_output["feature"].append(v.squeeze(0).transpose(0, 1))
-                    elif k == "__key__":
-                        raw_batch_output["ids"].append(v)
-                        raw_batch_output[k].append(v)
-                    else:
-                        raw_batch_output[k].append(v)
+                    if sample["audio"].numel() == 0:
+                        logging.warning(
+                            f"Sample {sample['__key__']} has empty audio after decoding, skipping."
+                        )
+                        continue
+                    for k, v in sample.items():
+                        if k == "audio":
+                            raw_batch_output["audio"].append(v.squeeze(0))
+                        elif k == "feature":
+                            raw_batch_output["feature"].append(
+                                v.squeeze(0).transpose(0, 1)
+                            )
+                        elif k == "__key__":
+                            raw_batch_output["ids"].append(v)
+                            raw_batch_output[k].append(v)
+                        else:
+                            raw_batch_output[k].append(v)
 
             if not raw_batch_output["audio"]:
                 continue
@@ -1111,9 +1143,10 @@ class ATDataloader(wds.WebLoader):
         epoch_hours: Optional[float] = None,
         mux_weights: Optional[List[float]] = None,
         min_length: float = 0.1,
-        max_length: float = 30.0,
+        max_length: float = 60.0,
         filter_func: Optional[Callable] = None,
         map_func: Optional[Callable] = None,
+        feature_type: Optional[str] = "fbank",
         feature_extractor: Optional[Callable] = None,
         use_noise_augment: bool = False,
         noise_augment: Tuple = (0.5, 10, 20),  # prob lower_snr_db, upper_snr_db
@@ -1163,6 +1196,10 @@ class ATDataloader(wds.WebLoader):
                 Function to filter samples, used when creating datasets from string manifests.
             map_func:
                 Function to map samples, used when creating datasets from string manifests.
+            feature_type:
+                Type of feature to extract, used when creating datasets from string manifests.
+                Using the internal feature extractor, only used when feature_extractor
+                is not provided. If feature_extractor is provided, this argument will be ignored. Default is "fbank".
             feature_extractor:
                 Feature extractor to extract features from raw audio, used when creating datasets
                 from string manifests.
@@ -1192,6 +1229,10 @@ class ATDataloader(wds.WebLoader):
                 Worker init function for dataloader.
             prefetch_factor:
                 Prefetch factor for dataloader, used when num_workers > 0.
+            seed:
+                Optional integer seed for reproducibility. Each worker is seeded with ``seed + worker_id``
+                so that different workers produce different (but deterministic) sequences.
+                When None, no seeding is applied and behaviour is non-deterministic.
             num_buckets:
                 Number of buckets for bucketing variable length audio samples.
             is_test:
@@ -1202,10 +1243,6 @@ class ATDataloader(wds.WebLoader):
             device:
                 Device to calculate features and doing augmentation, used when creating datasets from string manifests.
                 Note: All returned tensors will be on CPU, the device is only used for intermediate calculation.
-            seed:
-                Optional integer seed for reproducibility. Each worker is seeded with ``seed + worker_id``
-                so that different workers produce different (but deterministic) sequences.
-                When None, no seeding is applied and behaviour is non-deterministic.
         """
 
         if not isinstance(datasets, list):
@@ -1218,6 +1255,7 @@ class ATDataloader(wds.WebLoader):
                     manifest=ds,
                     sample_rate=sample_rate,
                     feature_extractor=feature_extractor,
+                    feature_type=feature_type,
                     min_length=min_length,
                     max_length=max_length,
                     filter_func=filter_func,
@@ -1230,14 +1268,44 @@ class ATDataloader(wds.WebLoader):
                     use_volume_perturb=use_volume_perturb,
                     volume_perturb=volume_perturb,
                     buffer_size=buffer_size,
+                    num_copies=num_copies,
                     is_test=is_test,
                     device=device,
                 )
                 atdatasets.append(atds)
             else:
-                assert isinstance(
-                    ds, ATDataset
-                ), "datasets entries must be str or ATDataset"
+                assert isinstance(ds, ATDataset), (
+                    "datasets entries must be str or ATDataset"
+                )
+                assert ds.sample_rate == sample_rate, (
+                    f"Dataset sample rate {ds.sample_rate} does not match dataloader sample rate {sample_rate}"
+                )
+                assert ds.num_copies == num_copies, (
+                    f"Dataset num_copies {ds.num_copies} does not match dataloader num_copies {num_copies}"
+                )
+                assert ds.device == device, (
+                    f"Dataset device {ds.device} does not match dataloader device {device}"
+                )
+                assert ds.is_test == is_test, (
+                    f"Dataset is_test {ds.is_test} does not match dataloader is_test {is_test}"
+                )
+                if feature_type is None:
+                    assert ds.feature_type is None, (
+                        f"Dataset feature_type {ds.feature_type} should be None when dataloader feature_type is None"
+                    )
+                else:
+                    assert ds.feature_type == feature_type, (
+                        f"Dataset feature_type {ds.feature_type} does not match dataloader feature_type {feature_type}"
+                    )
+                if feature_extractor is None:
+                    assert ds.feature_extractor is None, (
+                        f"Dataset feature_extractor should be None when dataloader feature_extractor is None"
+                    )
+                else:
+                    assert type(ds.feature_extractor) is type(feature_extractor), (
+                        f"Dataset feature_extractor should be of type {type(feature_extractor)} when dataloader "
+                        f"feature_extractor is of type {type(feature_extractor)}"
+                    )
                 atdatasets.append(ds)
 
         batched_dataset = BatchedDataset(
@@ -1247,14 +1315,16 @@ class ATDataloader(wds.WebLoader):
             max_samples=max_samples,
             epoch_hours=epoch_hours,
             mux_weights=mux_weights,
-            mux_intra_batch=mux_intra_batch,
             num_copies=num_copies,
+            mux_intra_batch=mux_intra_batch,
             num_buckets=num_buckets,
             is_test=is_test,
             device=device,
         )
 
         self.seed = seed
+        self.num_copies = num_copies
+
         self.dataset = batched_dataset
         self.epoch_batches = batched_dataset.epoch_batches_per_node
         self.num_workers = num_workers if not is_test else 0

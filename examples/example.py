@@ -35,7 +35,7 @@ def filter_func(sample):
 
 
 def map_func(sample, sp):
-    sample["tokens"] = sp.encode(sample["label"])
+    sample["tokens"] = sp.encode(sample["text"])
     return sample
 
 
@@ -44,7 +44,6 @@ def worker_init_fn(worker_id):
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
     )
-
 
 def main():
     feature_extractor = FbankExtractor(sample_rate=16000)
@@ -56,8 +55,8 @@ def main():
             "data/tars/aishell_train.lst",
             "data/tars/aishell2_train.lst",
         ],
-        max_duration=1000.0,
-        max_samples=1000,
+        max_duration=100.0,
+        max_samples=100,
         epoch_hours=sum(mux_weights),
         mux_weights=mux_weights,
         mux_intra_batch=True,
@@ -65,12 +64,13 @@ def main():
         filter_func=filter_func,
         map_func=_map_func,
         sample_rate=16000,
+        num_copies=2,
         use_noise_augment=True,
         noise_manifest="data/tars/musan.lst",
         use_speed_perturb=True,
         use_volume_perturb=True,
-        buffer_size=1000,
-        num_workers=4,
+        buffer_size=500,
+        num_workers=2,
         worker_init_fn=worker_init_fn,
         device=torch.device("cpu"),
     )
@@ -79,7 +79,7 @@ def main():
 
     start = time.time()
     for i, batch in enumerate(tqdm(dl, total=len(dl))):
-        # logging.info(f"Batch {i}: ids={batch['ids']}")
+        logging.info(f"Batch {i}: ids={batch['ids']}")
         pass
 
 
