@@ -42,13 +42,13 @@ def map_func(sample, sp):
 def worker_init_fn(worker_id):
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s [%(pathname)s:%(lineno)d] %(message)s",
+        format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
     )
 
 
 def main():
     feature_extractor = FbankExtractor(sample_rate=16000)
-    mux_weights = [350, 200]
+    mux_weights = [1350, 2000]
     sp = Ssentencepiece("librispeech-500")
     _map_func = partial(map_func, sp=sp)
     dl = ATDataloader(
@@ -56,8 +56,8 @@ def main():
             "data/tars/aishell_train.lst",
             "data/tars/aishell2_train.lst",
         ],
-        max_duration=200.0,
-        max_samples=200,
+        max_duration=1000.0,
+        max_samples=1000,
         epoch_hours=sum(mux_weights),
         mux_weights=mux_weights,
         mux_intra_batch=True,
@@ -69,7 +69,7 @@ def main():
         noise_manifest="data/tars/musan.lst",
         use_speed_perturb=True,
         use_volume_perturb=True,
-        buffer_size=100,
+        buffer_size=1000,
         num_workers=4,
         worker_init_fn=worker_init_fn,
         device=torch.device("cpu"),
@@ -86,7 +86,7 @@ def main():
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s [%(pathname)s:%(lineno)d] %(message)s",
+        format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
     )
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)

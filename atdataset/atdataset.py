@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright  2025 Wei Kang (wkang@pku.edu.cn)
+# Copyright  2025-2026 Wei Kang (wkang@pku.edu.cn)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -1127,6 +1127,7 @@ class ATDataloader(wds.WebLoader):
         num_workers: int = 4,
         worker_init_fn: Optional[Callable] = None,
         prefetch_factor: int = 2,
+        seed: Optional[int] = None,
         mux_intra_batch: bool = True,
         num_buckets: int = 30,
         is_test: bool = False,
@@ -1201,6 +1202,10 @@ class ATDataloader(wds.WebLoader):
             device:
                 Device to calculate features and doing augmentation, used when creating datasets from string manifests.
                 Note: All returned tensors will be on CPU, the device is only used for intermediate calculation.
+            seed:
+                Optional integer seed for reproducibility. Each worker is seeded with ``seed + worker_id``
+                so that different workers produce different (but deterministic) sequences.
+                When None, no seeding is applied and behaviour is non-deterministic.
         """
 
         if not isinstance(datasets, list):
@@ -1249,10 +1254,30 @@ class ATDataloader(wds.WebLoader):
             device=device,
         )
 
+        self.seed = seed
         self.dataset = batched_dataset
         self.epoch_batches = batched_dataset.epoch_batches_per_node
         self.num_workers = num_workers if not is_test else 0
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
+
+        if seed is not None:
+            # Seed the main process eagerly so single-process / is_test mode is also reproducible.
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+            _user_init = worker_init_fn
+            _seed = seed
+
+            def _worker_init_fn(worker_id: int):
+                worker_seed = _seed + worker_id
+                random.seed(worker_seed)
+                np.random.seed(worker_seed)
+                torch.manual_seed(worker_seed)
+                if _user_init is not None:
+                    _user_init(worker_id)
+
+            worker_init_fn = _worker_init_fn
 
         super().__init__(
             batched_dataset,
@@ -1266,7 +1291,8 @@ class ATDataloader(wds.WebLoader):
     def __repr__(self):
         return (
             f"ATDataloader(dataset={self.dataset}, length={self.epoch_batches}, "
-            f"num_workers={self.num_workers}, prefetch_factor={self.prefetch_factor})"
+            f"num_workers={self.num_workers}, prefetch_factor={self.prefetch_factor}, "
+            f"seed={self.seed})"
         )
 
     def __str__(self):
