@@ -16,7 +16,7 @@
 # limitations under the License.
 
 
-from atdataset import ATDataloader, FbankExtractor
+from atdataset import ATDataloader, Fbank
 from tqdm import tqdm
 import logging
 import torch
@@ -46,7 +46,7 @@ def worker_init_fn(worker_id):
     )
 
 def main():
-    feature_extractor = FbankExtractor(sample_rate=16000)
+    feature_extractor = Fbank(sample_rate=16000)
     mux_weights = [1350, 2000]
     sp = Ssentencepiece("librispeech-500")
     _map_func = partial(map_func, sp=sp)
@@ -57,6 +57,7 @@ def main():
         ],
         max_duration=100.0,
         max_samples=100,
+        batch_size=16,
         epoch_hours=sum(mux_weights),
         mux_weights=mux_weights,
         mux_intra_batch=True,

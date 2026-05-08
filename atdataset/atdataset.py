@@ -131,16 +131,17 @@ def augment_with_noise(audio, noise_sampler, lower_snr_db, upper_snr_db, is_test
     return audio
 
 
-def get_manifest_duration(manifest_path: str) -> float:
+def get_manifest_duration_num_samples(manifest_path: str) -> Tuple[float, int]:
     """
-    Calculate total duration of audio files in a manifest file.
+    Calculate total duration and number of samples of audio files in a manifest file.
     Args:
       manifest_path:
         Path to the manifest file containing audio file paths and durations.
         Each line in the manifest file is in the format of:
-        {"audio_filepath": path, "text": text, "duration": duration_in_seconds}
+        {"audio_filepath": path, "text": text, "duration": duration_in_seconds, "num_samples": num_samples}
     """
     total_duration = 0.0
+    total_num_samples = 0
     with open(manifest_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -149,7 +150,8 @@ def get_manifest_duration(manifest_path: str) -> float:
             item = json.loads(line)
             if "duration" in item:
                 total_duration += float(item["duration"])
-    return total_duration
+            total_num_samples += 1
+    return total_duration, total_num_samples
 
 
 class AudioDecoder:
@@ -353,15 +355,16 @@ class ATDataset(torch.utils.data.IterableDataset):
         use_noise_augment: bool = False,
         noise_augment: Tuple = (0.5, 10, 20),  # probs lower_db, upper_db
         noise_manifest: Optional[str] = None,
-        use_speed_perturb: bool = True,
+        use_speed_perturb: bool = False,
         speed_perturb: Tuple = (0.9, 1.0, 1.1),  # speeds
-        use_volume_perturb: bool = True,
+        use_volume_perturb: bool = False,
         volume_perturb: Tuple = (0.5, -10, 6),  # prob, lower_db, upper_db
-        feature_type: Optional[str] = "fbank",
+        feature_type: Optional[str] = "Fbank",
         feature_extractor: Optional[Callable] = None,
         num_copies: int = 1,
         buffer_size: int = 1000,
         is_test: bool = False,
+        need_num_samples: bool = False,
         device=torch.device("cpu"),
     ):
         """
@@ -402,6 +405,8 @@ class ATDataset(torch.utils.data.IterableDataset):
                 Whether the dataset is for training or not.
             device:
                 Device to calculate features.
+            need_num_samples:
+                Whether to calculate the number of samples in the dataset.
         """
         super().__init__()
 
@@ -418,6 +423,7 @@ class ATDataset(torch.utils.data.IterableDataset):
         self.use_volume_perturb = use_volume_perturb
         self.volume_perturb = volume_perturb
         self.num_copies = num_copies
+        self.need_num_samples = need_num_samples
 
         assert os.path.exists(manifest), f"Manifest file {manifest} does not exist."
         self.manifest = manifest
@@ -435,7 +441,9 @@ class ATDataset(torch.utils.data.IterableDataset):
         labels_to_audios: Dict[str, str] = {}
         audio_tars: List[str] = []
         duration_hours = 0.0
+        num_samples = 0
         log_duration_warning = True  # to avoid too many warnings
+        log_num_samples_warning = True  # to avoid too many warnings
         with open(self.manifest, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -455,6 +463,7 @@ class ATDataset(torch.utils.data.IterableDataset):
                         f"{items[1]} does not exist, skipping line : {line}."
                     )
                     continue
+                tmp_num_samples = None
                 if len(items) < 3:
                     if log_duration_warning:
                         logging.warning(
@@ -463,9 +472,26 @@ class ATDataset(torch.utils.data.IterableDataset):
                             f" Please consider adding duration field to the manifest file."
                         )
                         log_duration_warning = False
-                    duration_hours += get_manifest_duration(items[1]) / 3600.0
+                    tmp_duration, tmp_num_samples = get_manifest_duration_num_samples(items[1])
+                    duration_hours += tmp_duration / 3600.0
                 else:
                     duration_hours += float(items[2])
+
+                if self.need_num_samples:
+                    if len(items) < 4:
+                        if tmp_num_samples is None:
+                            if log_num_samples_warning:
+                                logging.warning(
+                                    f"Manifest file {self.manifest} does not contain num_samples "
+                                    f"field, calculating num_samples from manifests, might be slow."
+                                    f" Please consider adding num_samples field to the manifest file."
+                                )
+                                log_num_samples_warning = False
+                            _, tmp_num_samples = get_manifest_duration_num_samples(items[1])
+                        num_samples += tmp_num_samples
+                    else:
+                        num_samples += int(items[3])
+
                 audio_tars.append(items[0])
                 labels_to_audios[items[0]] = items[1]
 
@@ -474,10 +500,12 @@ class ATDataset(torch.utils.data.IterableDataset):
                 f"Manifest {self.manifest} has very small duration : {duration_hours}, "
                 f"please check if the manifest files are correct, especially the duration field."
             )
-        logging.info(f"Manifest {self.manifest} duration: {duration_hours:.2f} hours")
+        logging.info(f"Manifest {self.manifest} duration: {duration_hours:.2f} hours"
+                     + (f" num_samples: {num_samples}" if self.need_num_samples else ""))
 
         self.audio_tars = audio_tars
         self.duration_hours = duration_hours
+        self.num_samples = num_samples
 
         # sample_decoder is to decode audio and assign label
         self.sample_decoder = SampleDecoder(
@@ -552,7 +580,7 @@ class ATDataset(torch.utils.data.IterableDataset):
     def __repr__(self):
         return (
             f"ATDataset(manifest={self.manifest}, sample_rate={self.sample_rate}, "
-            f"duration_hours={self.duration_hours:.2f}, buffer_size={self.buffer_size}, "
+            f"duration_hours={self.duration_hours:.2f}, num_samples={self.num_samples}, buffer_size={self.buffer_size}, "
             f"min_length={self.min_length:.2f}, max_length={self.max_length:.2f}, "
             f"use_speed_perturb={self.use_speed_perturb}, speed_perturb={self.speed_perturb}, "
             f"use_volume_perturb={self.use_volume_perturb}, volume_perturb={self.volume_perturb}, "
@@ -687,6 +715,7 @@ class StreamingBucketBatcher:
         weights: List[float],
         sample_rate: int = 16000,
         max_samples: Optional[int] = None,
+        batch_size: Optional[int] = None,
         min_length: Union[float, List[float]] = 0.1,  # in seconds
         max_length: Union[float, List[float]] = 30,  # in seconds
         num_buckets: int = 30,
@@ -704,6 +733,8 @@ class StreamingBucketBatcher:
             Sample rate of the audio samples.
           max_samples:
             Maximum number of samples for each batch.
+          batch_size:
+            The num of samples in each batch, if specified, will override max_duration and max_samples.
           min_length:
             Minimum length (in seconds) of samples to consider.
           max_length:
@@ -720,7 +751,11 @@ class StreamingBucketBatcher:
         self.max_duration = max_duration
         # approximate max samples based on max_duration (1 second per sample)
         self.max_samples = max_samples if max_samples is not None else int(max_duration)
-        self.num_buckets = num_buckets
+        self.batch_size = batch_size
+
+        # use 1 bucket if batch_size is specified, so will not change the bucket assignment logic,
+        # and just fill the batch with samples from the same bucket until batch_size is reached.
+        self.num_buckets = num_buckets if batch_size is None else 1
 
         self.min_length = min_length
         self.max_length = max_length
@@ -792,14 +827,19 @@ class StreamingBucketBatcher:
             try:
                 if self.mux_intra_batch:
                     while True:
-                        full_buckets = [
-                            i
-                            for i in range(self.num_buckets)
-                            if self.bucket_item_lengths[i] * len(self.buckets[i])
-                            > self.max_duration * 1.5
-                        ]
-                        if full_buckets:
-                            break
+                        if self.batch_size is not None:
+                            if len(self.buckets) > self.batch_size:
+                                full_buckets = [0]
+                                break
+                        else:
+                            full_buckets = [
+                                i
+                                for i in range(self.num_buckets)
+                                if self.bucket_item_lengths[i] * len(self.buckets[i])
+                                > self.max_duration * 1.5
+                            ]
+                            if full_buckets:
+                                break
                         stream_idx = np.random.choice(len(streams), p=weights)
                         samples = next(streams[stream_idx])
                         if isinstance(samples, list):
@@ -812,15 +852,20 @@ class StreamingBucketBatcher:
                 else:
                     stream_idx = np.random.choice(len(streams), p=weights)
                     while True:
-                        full_buckets = [
-                            i
-                            for i in range(self.num_buckets)
-                            if self.bucket_item_lengths[stream_idx][i]
-                            * len(self.buckets[stream_idx][i])
-                            > self.max_duration * 1.5
-                        ]
-                        if full_buckets:
-                            break
+                        if self.batch_size is not None:
+                            if len(self.buckets[stream_idx]) > self.batch_size:
+                                full_buckets = [0]
+                                break
+                        else:
+                            full_buckets = [
+                                i
+                                for i in range(self.num_buckets)
+                                if self.bucket_item_lengths[stream_idx][i]
+                                * len(self.buckets[stream_idx][i])
+                                > self.max_duration * 1.5
+                            ]
+                            if full_buckets:
+                                break
                         samples = next(streams[stream_idx])
                         if isinstance(samples, list):
                             sample = samples[0]
@@ -857,11 +902,12 @@ class StreamingBucketBatcher:
             num_samples = 0
             max_sample_length = 0
             batch = []
-            batch_duration = 0
 
             buckets = self.buckets if self.mux_intra_batch else self.buckets[stream_idx]
             for b_id in bucket_range:
                 while buckets[b_id]:
+                    if self.batch_size is not None and num_samples >= self.batch_size:
+                        break
                     if num_samples >= self.max_samples:
                         break
                     samples = buckets[b_id][0]
@@ -871,7 +917,7 @@ class StreamingBucketBatcher:
                         sample = samples
                     length = sample[self.length_key].size(1) / self.sample_rate
                     tmp_max_sample_length = max(max_sample_length, length)
-                    if tmp_max_sample_length * (num_samples + 1) > self.max_duration:
+                    if tmp_max_sample_length * (num_samples + 1) > self.max_duration and self.batch_size is None:
                         if not batch:
                             last_b_id = b_id
                             # for break the outer for loop
@@ -886,6 +932,7 @@ class StreamingBucketBatcher:
                 if (
                     max_sample_length * num_samples >= self.max_duration
                     or num_samples >= self.max_samples
+                    or (self.batch_size is not None and num_samples >= self.batch_size)
                 ):
                     break
 
@@ -907,6 +954,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         sample_rate: int,
         max_duration: float,
         max_samples: Optional[int] = None,
+        batch_size: Optional[int] = None,
         epoch_hours: Optional[float] = None,
         mux_weights: Optional[List[float]] = None,
         mux_intra_batch: bool = True,
@@ -927,6 +975,10 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             Maximum duration (in seconds) for each batch.
           max_samples:
             Maximum number of samples for each batch.
+          batch_size:
+            If specified, will use fixed batch size instead of max_duration to control batch size.
+            When batch_size is specified, max_duration and max_samples will be ignored, and the batcher
+            will create batches with batch_size samples.
           epoch_hours:
             Total hours of audio to process in one epoch.
             If None, will use the sum of durations of the datasets.
@@ -953,6 +1005,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         self.mux_intra_batch = mux_intra_batch
         self.num_copies = num_copies
         self.device = device
+        self.batch_size = batch_size
 
         if isinstance(datasets, ATDataset):
             self.datasets = [datasets]
@@ -964,6 +1017,8 @@ class BatchedDataset(torch.utils.data.IterableDataset):
 
         calculated_hours = 0.0
         dataset_hours = []
+        calculated_samples = 0
+        dataset_samples = []
         min_length = 1e10
         min_lengths = []
         max_length = 0.0
@@ -971,6 +1026,8 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         for at in self.datasets:
             calculated_hours += at.duration_hours
             dataset_hours.append(at.duration_hours)
+            calculated_samples += at.num_samples
+            dataset_samples.append(at.num_samples)
             min_lengths.append(at.min_length)
             max_lengths.append(at.max_length)
             if at.min_length < min_length:
@@ -1032,7 +1089,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
     def __repr__(self):
         return (
             f"BatchedDataset(sample_rate={self.sample_rate}, max_duration={self.max_duration}, "
-            f"max_samples={self.max_samples}, epoch_hours={self.epoch_hours:.2f}, "
+            f"max_samples={self.max_samples}, batch_size={self.batch_size}, epoch_hours={self.epoch_hours:.2f}, "
             f"mux_weights={self.mux_weights}, num_copies={self.num_copies}, mux_intra_batch={self.mux_intra_batch}, "
             f"is_test={self.is_test}, num_buckets={self.num_buckets}, device={self.device}, "
             f"datasets={self.datasets})"
@@ -1044,6 +1101,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         batcher = StreamingBucketBatcher(
             max_duration=self.max_duration,
             max_samples=self.max_samples,
+            batch_size=self.batch_size,
             sample_rate=self.sample_rate,
             min_length=self.min_length if self.mux_intra_batch else self.min_lengths,
             max_length=self.max_length if self.mux_intra_batch else self.max_lengths,
@@ -1132,7 +1190,6 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             yield batch_output
 
 
-# TODO: support fixed batch size by using only one bucket.
 class ATDataloader(wds.WebLoader):
     def __init__(
         self,
@@ -1140,20 +1197,21 @@ class ATDataloader(wds.WebLoader):
         sample_rate: int,
         max_duration: float = 600.0,
         max_samples: Optional[int] = None,
+        batch_size: Optional[int] = None,
         epoch_hours: Optional[float] = None,
         mux_weights: Optional[List[float]] = None,
         min_length: float = 0.1,
         max_length: float = 60.0,
         filter_func: Optional[Callable] = None,
         map_func: Optional[Callable] = None,
-        feature_type: Optional[str] = "fbank",
+        feature_type: Optional[str] = "Fbank",
         feature_extractor: Optional[Callable] = None,
         use_noise_augment: bool = False,
-        noise_augment: Tuple = (0.5, 10, 20),  # prob lower_snr_db, upper_snr_db
+        noise_augment: Tuple = (0.5, 10, 20),  # prob, lower_snr_db, upper_snr_db
         noise_manifest: Optional[str] = None,
-        use_speed_perturb: bool = True,
+        use_speed_perturb: bool = False,
         speed_perturb: Tuple = (0.9, 1.0, 1.1),  # speeds
-        use_volume_perturb: bool = True,
+        use_volume_perturb: bool = False,
         volume_perturb: Tuple = (0.5, -10, 6),  # prob, lower_db, upper_db
         num_copies: int = 1,
         buffer_size: int = 1000,
@@ -1181,6 +1239,10 @@ class ATDataloader(wds.WebLoader):
             max_samples:
                 Maximum number of samples for each batch, used together with max_duration
                 to control batch size.
+            batch_size:
+                If specified, will use fixed batch size instead of max_duration to control batch size.
+                When batch_size is specified, max_duration and max_samples will be ignored, and the batcher
+                will create batches with batch_size samples.
             epoch_hours:
                 Number of hours per epoch. If None, will calculate based on manifest durations.
             mux_weights:
@@ -1214,7 +1276,7 @@ class ATDataloader(wds.WebLoader):
                 Whether to use speed perturbation, used when creating datasets from string manifests.
             speed_perturb:
                 Tuple of speeds for speed perturbation, used when creating datasets from string manifests.
-            use_speed_perturb:
+            use_volume_perturb:
                 Whether to use volume perturbation, used when creating datasets from string manifests.
             volume_perturb:
                 Tuple of (probability, lower_db, upper_db) for volume perturbation, used when
@@ -1248,6 +1310,10 @@ class ATDataloader(wds.WebLoader):
         if not isinstance(datasets, list):
             datasets = [datasets]
 
+        max_duration = max_duration / num_copies if max_duration is not None else None
+        max_samples = max_samples // num_copies if max_samples is not None else None
+        batch_size = batch_size // num_copies if batch_size is not None else None
+
         atdatasets: List[ATDataset] = []
         for ds in datasets:
             if isinstance(ds, str):
@@ -1270,6 +1336,7 @@ class ATDataloader(wds.WebLoader):
                     buffer_size=buffer_size,
                     num_copies=num_copies,
                     is_test=is_test,
+                    need_num_samples=batch_size is not None,
                     device=device,
                 )
                 atdatasets.append(atds)
@@ -1288,6 +1355,10 @@ class ATDataloader(wds.WebLoader):
                 )
                 assert ds.is_test == is_test, (
                     f"Dataset is_test {ds.is_test} does not match dataloader is_test {is_test}"
+                )
+                assert ds.need_num_samples == (batch_size is not None), (
+                    f"Dataset need_num_samples {ds.need_num_samples} does not match dataloader"
+                    f" need_num_samples {batch_size is not None}"
                 )
                 if feature_type is None:
                     assert ds.feature_type is None, (
@@ -1313,6 +1384,7 @@ class ATDataloader(wds.WebLoader):
             sample_rate=sample_rate,
             max_duration=max_duration,
             max_samples=max_samples,
+            batch_size=batch_size,
             epoch_hours=epoch_hours,
             mux_weights=mux_weights,
             num_copies=num_copies,
