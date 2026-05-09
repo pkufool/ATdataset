@@ -18,14 +18,12 @@
 
 import collections
 import copy
-import glob
 import io
 import json
 import logging
 import math
 import os
 import random
-import time
 
 from functools import partial
 from typing import Any, List, Tuple, Dict, Callable, Optional, Union
@@ -39,6 +37,11 @@ import torchaudio
 import webdataset as wds
 
 from webdataset.utils import pytorch_worker_info
+
+try:
+    from atdataset.feature import Fbank, KaldiFbank, WhisperFbank
+except ImportError:
+    Fbank = KaldiFbank = WhisperFbank = None
 
 
 def fix_sample_key(sample):
@@ -472,7 +475,9 @@ class ATDataset(torch.utils.data.IterableDataset):
                             f" Please consider adding duration field to the manifest file."
                         )
                         log_duration_warning = False
-                    tmp_duration, tmp_num_samples = get_manifest_duration_num_samples(items[1])
+                    tmp_duration, tmp_num_samples = get_manifest_duration_num_samples(
+                        items[1]
+                    )
                     duration_hours += tmp_duration / 3600.0
                 else:
                     duration_hours += float(items[2])
@@ -487,7 +492,9 @@ class ATDataset(torch.utils.data.IterableDataset):
                                     f" Please consider adding num_samples field to the manifest file."
                                 )
                                 log_num_samples_warning = False
-                            _, tmp_num_samples = get_manifest_duration_num_samples(items[1])
+                            _, tmp_num_samples = get_manifest_duration_num_samples(
+                                items[1]
+                            )
                         num_samples += tmp_num_samples
                     else:
                         num_samples += int(items[3])
@@ -500,8 +507,10 @@ class ATDataset(torch.utils.data.IterableDataset):
                 f"Manifest {self.manifest} has very small duration : {duration_hours}, "
                 f"please check if the manifest files are correct, especially the duration field."
             )
-        logging.info(f"Manifest {self.manifest} duration: {duration_hours:.2f} hours"
-                     + (f" num_samples: {num_samples}" if self.need_num_samples else ""))
+        logging.info(
+            f"Manifest {self.manifest} duration: {duration_hours:.2f} hours"
+            + (f" num_samples: {num_samples}" if self.need_num_samples else "")
+        )
 
         self.audio_tars = audio_tars
         self.duration_hours = duration_hours
@@ -828,7 +837,7 @@ class StreamingBucketBatcher:
                 if self.mux_intra_batch:
                     while True:
                         if self.batch_size is not None:
-                            if len(self.buckets) > self.batch_size:
+                            if len(self.buckets[0]) > self.batch_size:
                                 full_buckets = [0]
                                 break
                         else:
@@ -908,7 +917,7 @@ class StreamingBucketBatcher:
                 while buckets[b_id]:
                     if self.batch_size is not None and num_samples >= self.batch_size:
                         break
-                    if num_samples >= self.max_samples:
+                    if num_samples >= self.max_samples and self.batch_size is None:
                         break
                     samples = buckets[b_id][0]
                     if isinstance(samples, list):
@@ -917,7 +926,10 @@ class StreamingBucketBatcher:
                         sample = samples
                     length = sample[self.length_key].size(1) / self.sample_rate
                     tmp_max_sample_length = max(max_sample_length, length)
-                    if tmp_max_sample_length * (num_samples + 1) > self.max_duration and self.batch_size is None:
+                    if (
+                        tmp_max_sample_length * (num_samples + 1) > self.max_duration
+                        and self.batch_size is None
+                    ):
                         if not batch:
                             last_b_id = b_id
                             # for break the outer for loop
@@ -1040,10 +1052,14 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         self.max_lengths = max_lengths
 
         if epoch_hours is None:
-            logging.info(f"Using calculated epoch hours: {calculated_hours:.2f}")
+            if batch_size is None:
+                logging.info(f"Using calculated epoch hours: {calculated_hours:.2f}")
             self.epoch_hours = calculated_hours
         else:
-            if abs(calculated_hours - epoch_hours) / epoch_hours > 0.05:
+            if (
+                abs(calculated_hours - epoch_hours) / epoch_hours > 0.05
+                and batch_size is None
+            ):
                 logging.warning(
                     f"Given epoch hours {epoch_hours} differ from calculated "
                     f"hours {calculated_hours:.2f} by more than 5%. "
@@ -1051,7 +1067,10 @@ class BatchedDataset(torch.utils.data.IterableDataset):
                 )
             self.epoch_hours = epoch_hours
 
-        calculated_mux_weights = [dur / calculated_hours for dur in dataset_hours]
+        if batch_size is not None:
+            calculated_mux_weights = [s / calculated_samples for s in dataset_samples]
+        else:
+            calculated_mux_weights = [dur / calculated_hours for dur in dataset_hours]
         if mux_weights is None and len(self.datasets) > 1:
             logging.info(f"Using calculated mux weights: {calculated_mux_weights}")
             self.mux_weights = calculated_mux_weights
@@ -1079,9 +1098,14 @@ class BatchedDataset(torch.utils.data.IterableDataset):
                 self.mux_weights = [1]
 
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        self.epoch_batches_per_node = math.ceil(
-            self.epoch_hours * 3600.0 / world_size / self.max_duration
-        )
+        if self.batch_size is not None:
+            self.epoch_batches_per_node = math.ceil(
+                calculated_samples / self.batch_size / world_size
+            )
+        else:
+            self.epoch_batches_per_node = math.ceil(
+                self.epoch_hours * 3600.0 / world_size / self.max_duration
+            )
 
     def __str__(self):
         return self.__repr__()

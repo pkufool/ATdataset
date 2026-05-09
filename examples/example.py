@@ -45,6 +45,7 @@ def worker_init_fn(worker_id):
         format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
     )
 
+
 def main():
     feature_extractor = Fbank(sample_rate=16000)
     mux_weights = [1350, 2000]
@@ -57,9 +58,9 @@ def main():
         ],
         max_duration=100.0,
         max_samples=100,
-        batch_size=16,
+        batch_size=32,
         epoch_hours=sum(mux_weights),
-        mux_weights=mux_weights,
+        mux_weights=None,
         mux_intra_batch=True,
         feature_extractor=feature_extractor,
         filter_func=filter_func,
@@ -71,7 +72,7 @@ def main():
         use_speed_perturb=True,
         use_volume_perturb=True,
         buffer_size=500,
-        num_workers=2,
+        num_workers=0,
         worker_init_fn=worker_init_fn,
         device=torch.device("cpu"),
     )

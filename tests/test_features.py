@@ -9,7 +9,7 @@ Comparisons:
   3. WhisperFbank vs  whisper.audio.log_mel_spectrogram
 
 Run:
-    cd /star-kw/kangwei/code/ATdataset
+    cd path/to/ATdataset
     python tests/test_features.py          # standalone
     python -m pytest tests/test_features.py -v -p no:hydra   # pytest
 """
@@ -44,6 +44,7 @@ AUDIO_TORCH = torch.from_numpy(AUDIO_NP)
 # 1. Fbank  vs  torchaudio
 # ---------------------------------------------------------------------------
 
+
 def test_fbank_shape():
     """Fbank output shape should be (1, n_mels, n_frames)."""
     ext = Fbank(sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=80)
@@ -56,8 +57,12 @@ def test_fbank_matches_torchaudio():
     """Fbank wraps torchaudio MelSpectrogram; output must be identical."""
     ext = Fbank(sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=80)
     mel_spec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=80,
-        center=True, power=1,
+        sample_rate=SAMPLE_RATE,
+        n_fft=400,
+        hop_length=160,
+        n_mels=80,
+        center=True,
+        power=1,
     )
     ref = mel_spec(AUDIO_TORCH.unsqueeze(0)).clamp(min=1e-7).log()
     # Pass tensor (not numpy) — Fbank.forward references self.device which is
@@ -73,12 +78,20 @@ def test_fbank_matches_torchaudio():
 # 2. KaldiFbank  vs  lhotse
 # ---------------------------------------------------------------------------
 
+
 def test_kaldifbank_shape():
     """KaldiFbank output shape should be (1, n_frames, num_filters)."""
     ext = KaldiFbank(
-        sampling_rate=SAMPLE_RATE, frame_length=0.025, frame_shift=0.01,
-        window_type="povey", snip_edges=False, energy_floor=1e-10,
-        low_freq=20.0, high_freq=-400.0, num_filters=80, dither=0.0,
+        sampling_rate=SAMPLE_RATE,
+        frame_length=0.025,
+        frame_shift=0.01,
+        window_type="povey",
+        snip_edges=False,
+        energy_floor=1e-10,
+        low_freq=20.0,
+        high_freq=-400.0,
+        num_filters=80,
+        dither=0.0,
         torchaudio_compatible_mel_scale=True,
     )
     out = ext(AUDIO_TORCH.unsqueeze(0), sample_rate=SAMPLE_RATE)
@@ -91,9 +104,16 @@ def test_kaldifbank_matches_lhotse():
     from lhotse.features.kaldi.layers import Wav2LogFilterBank
 
     params = dict(
-        sampling_rate=SAMPLE_RATE, frame_length=0.025, frame_shift=0.01,
-        window_type="povey", snip_edges=False, energy_floor=1e-10,
-        low_freq=20.0, high_freq=-400.0, num_filters=80, dither=0.0,
+        sampling_rate=SAMPLE_RATE,
+        frame_length=0.025,
+        frame_shift=0.01,
+        window_type="povey",
+        snip_edges=False,
+        energy_floor=1e-10,
+        low_freq=20.0,
+        high_freq=-400.0,
+        num_filters=80,
+        dither=0.0,
         torchaudio_compatible_mel_scale=True,
     )
     ours = KaldiFbank(**params)
@@ -112,10 +132,14 @@ def test_kaldifbank_matches_lhotse():
 # 3. WhisperFbank  vs  openai-whisper
 # ---------------------------------------------------------------------------
 
+
 def test_whisperfbank_shape():
     """WhisperFbank output shape should be (1, n_mels, n_frames)."""
     ext = WhisperFbank(
-        sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=80,
+        sample_rate=SAMPLE_RATE,
+        n_fft=400,
+        hop_length=160,
+        n_mels=80,
     )
     out = ext(AUDIO_NP, sample_rate=SAMPLE_RATE)
     # n_frames = floor(16000/160) = 100
@@ -123,13 +147,24 @@ def test_whisperfbank_shape():
 
 
 def test_whisperfbank_output_range():
-    """Whisper normalisation should map output to [-1, 0]."""
+    """WhisperFbank output range should match whisper.audio."""
+    import whisper.audio as waudio
+
     ext = WhisperFbank(
-        sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=80,
+        sample_rate=SAMPLE_RATE,
+        n_fft=400,
+        hop_length=160,
+        n_mels=80,
     )
+    ref = waudio.log_mel_spectrogram(AUDIO_TORCH, n_mels=80)
     out = ext(AUDIO_NP, sample_rate=SAMPLE_RATE)
-    assert float(out.min()) >= -1.0 - 1e-6, f"Min {float(out.min()):.4f} below -1"
-    assert float(out.max()) <= 0.0 + 1e-6, f"Max {float(out.max()):.4f} above 0"
+    out_t = torch.from_numpy(out).squeeze(0)
+    assert float(out_t.min()) == float(ref.min()), (
+        f"Min mismatch: ours={float(out_t.min()):.4f}, ref={float(ref.min()):.4f}"
+    )
+    assert float(out_t.max()) == float(ref.max()), (
+        f"Max mismatch: ours={float(out_t.max()):.4f}, ref={float(ref.max()):.4f}"
+    )
 
 
 def test_whisperfbank_mel_filters():
@@ -146,12 +181,19 @@ def test_whisperfbank_mel_filters():
     librosa_filters = torch.from_numpy(
         librosa.filters.mel(sr=16000, n_fft=400, n_mels=80)
     )
-    our_filters = WhisperFbank._whisper_mel_filters(
-        n_mels=80, n_fft=400, sample_rate=16000,
-    ) if hasattr(WhisperFbank, "_whisper_mel_filters") else None
+    our_filters = (
+        WhisperFbank._whisper_mel_filters(
+            n_mels=80,
+            n_fft=400,
+            sample_rate=16000,
+        )
+        if hasattr(WhisperFbank, "_whisper_mel_filters")
+        else None
+    )
 
     # Also import the standalone function
     from atdataset.feature import _whisper_mel_filters
+
     our_filters = _whisper_mel_filters(n_mels=80, n_fft=400, sample_rate=16000)
 
     # Verify whisper's npz matches librosa (sanity check)
@@ -174,13 +216,14 @@ def test_whisperfbank_matches_whisper():
     import whisper.audio as waudio
 
     ext = WhisperFbank(
-        sample_rate=SAMPLE_RATE, n_fft=400, hop_length=160, n_mels=80,
+        sample_rate=SAMPLE_RATE,
+        n_fft=400,
+        hop_length=160,
+        n_mels=80,
     )
     ref = waudio.log_mel_spectrogram(AUDIO_TORCH, n_mels=80)
     out = ext(AUDIO_NP, sample_rate=SAMPLE_RATE)
-    max_diff = float(
-        torch.from_numpy(out).squeeze(0).sub(ref).abs().max()
-    )
+    max_diff = float(torch.from_numpy(out).squeeze(0).sub(ref).abs().max())
     assert max_diff < 1e-4, (
         f"WhisperFbank diverges from whisper.audio.log_mel_spectrogram "
         f"(max diff={max_diff:.2e})"
@@ -238,6 +281,7 @@ if __name__ == "__main__":
     # Try pytest first; fall back to built-in runner
     try:
         import pytest
+
         sys.exit(pytest.main([__file__, "-v", "-p", "no:hydra"]))
     except Exception:
         sys.exit(main())

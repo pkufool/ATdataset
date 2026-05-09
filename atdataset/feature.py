@@ -20,43 +20,125 @@ import warnings
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torchaudio
 
-from typing import Optional, Union
+from abc import ABC, abstractmethod
+from typing import Callable, Optional, Union
+
+
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
+
+
+class FeatureExtractor(ABC, torch.nn.Module):
+    """Base class for all feature extractors.
+
+    Subclasses must implement:
+      - ``frame_shift`` (property): frame shift in seconds.
+      - ``feature_dim()``: number of feature dimensions per frame.
+      - ``forward()``: feature extraction.
+    """
+
+    @property
+    @abstractmethod
+    def frame_shift(self) -> float: ...
+
+    @abstractmethod
+    def feature_dim(self) -> int: ...
+
+    @abstractmethod
+    def forward(
+        self,
+        samples: Union[np.ndarray, torch.Tensor],
+        sample_rate: int,
+        average_channels: bool = True,
+    ) -> torch.Tensor: ...
 
 
 # ---------------------------------------------------------------------------
 # Fbank (torchaudio-based)
 # ---------------------------------------------------------------------------
 
-class Fbank(torch.nn.Module):
+
+class Fbank(FeatureExtractor):
     def __init__(
         self,
         sample_rate: int = 16000,
-        n_fft: int = 400,
-        hop_length: int = 160,
         n_mels: int = 80,
+        n_fft: int = 400,
+        win_length: Optional[int] = None,
+        hop_length: Optional[int] = 160,
+        f_min: float = 0.0,
+        f_max: Optional[float] = None,
+        pad: int = 0,
+        window_fn: Callable[..., torch.Tensor] = torch.hann_window,
+        power: float = 1.0,
+        normalized: bool = False,
+        wkwargs: Optional[dict] = None,
+        center: bool = True,
+        pad_mode: str = "reflect",
+        onesided: Optional[bool] = None,
+        norm: Optional[str] = None,
+        mel_scale: str = "htk",
     ):
         super().__init__()
         self.fbank = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
+            win_length=win_length,
             hop_length=hop_length,
+            f_min=f_min,
+            f_max=f_max,
+            pad=pad,
             n_mels=n_mels,
-            center=True,
-            power=1,
+            window_fn=window_fn,
+            power=power,
+            normalized=normalized,
+            wkwargs=wkwargs,
+            center=center,
+            pad_mode=pad_mode,
+            onesided=onesided,
+            norm=norm,
+            mel_scale=mel_scale,
         )
         self.sample_rate = sample_rate
-        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.win_length = win_length
         self.hop_length = hop_length
+        self.f_min = f_min
+        self.f_max = f_max
+        self.pad = pad
+        self.n_mels = n_mels
+        self.window_fn = window_fn
+        self.power = power
+        self.normalized = normalized
+        self.wkwargs = wkwargs
+        self.center = center
+        self.pad_mode = pad_mode
+        self.onesided = onesided
+        self.norm = norm
+        self.mel_scale = mel_scale
 
     def __repr__(self):
         return (
             f"Fbank(sample_rate={self.sample_rate}, "
-            f"n_fft={self.fbank.n_fft}, "
+            f"n_fft={self.n_fft}, "
+            f"win_length={self.win_length}, "
             f"hop_length={self.hop_length}, "
-            f"n_mels={self.n_mels})"
+            f"f_min={self.f_min}, "
+            f"f_max={self.f_max}, "
+            f"pad={self.pad}, "
+            f"n_mels={self.n_mels}, "
+            f"window_fn={self.window_fn.__name__}, "
+            f"power={self.power}, "
+            f"normalized={self.normalized}, "
+            f"wkwargs={self.wkwargs}, "
+            f"center={self.center}, "
+            f"pad_mode={self.pad_mode}, "
+            f"onesided={self.onesided}, "
+            f"norm={self.norm}, "
+            f"mel_scale={self.mel_scale})"
         )
 
     def __str__(self):
@@ -92,7 +174,6 @@ class Fbank(torch.nn.Module):
                     samples = samples.mean(dim=0, keepdim=True)
                 else:
                     samples = samples[0:1]
-
         mel = self.fbank(samples)
         mel = mel.clamp(min=1e-7).log()
         return mel
@@ -201,6 +282,10 @@ def _pow_spectrogram(x: torch.Tensor) -> torch.Tensor:
     return x.abs() ** 2
 
 
+def _spectrogram(x: torch.Tensor) -> torch.Tensor:
+    return x.abs()
+
+
 def _get_mel_banks(
     num_bins: int,
     window_length_padded: int,
@@ -283,8 +368,6 @@ def _create_mel_scale(
     return torch.from_numpy(B)
 
 
-
-
 # ---------------------------------------------------------------------------
 # KaldiFbank  –  self-contained Kaldi-style log-Mel filter bank extractor
 # ---------------------------------------------------------------------------
@@ -294,7 +377,7 @@ def _create_mel_scale(
 # file has zero dependency on lhotse.
 
 
-class KaldiFbank(torch.nn.Module):
+class KaldiFbank(FeatureExtractor):
     """Kaldi-style log Mel filter bank feature extractor.
 
     The implementation is identical to lhotse's ``Wav2LogFilterBank`` but is
@@ -332,7 +415,7 @@ class KaldiFbank(torch.nn.Module):
 
         self.sampling_rate = sampling_rate
         self.frame_length = frame_length
-        self.frame_shift = frame_shift
+        self._frame_shift = frame_shift
         self.round_to_power_of_two = round_to_power_of_two
         self.remove_dc_offset = remove_dc_offset
         self.preemph_coeff = preemph_coeff
@@ -356,12 +439,12 @@ class KaldiFbank(torch.nn.Module):
         self.fft_length = _next_power_of_2(N) if round_to_power_of_two else N
 
         # Window (from Wav2Win)
-        self._window = nn.Parameter(
+        self._window = torch.nn.Parameter(
             _create_frame_window(N, window_type=window_type), requires_grad=False
         )
 
         # Epsilon for log stability (from Wav2LogFilterBank)
-        self._eps = nn.Parameter(
+        self._eps = torch.nn.Parameter(
             torch.tensor(torch.finfo(torch.float).eps), requires_grad=False
         )
 
@@ -384,7 +467,7 @@ class KaldiFbank(torch.nn.Module):
                 high_freq=high_freq,
                 norm_filters=norm_filters,
             )
-        self._fb = nn.Parameter(fb, requires_grad=False)
+        self._fb = torch.nn.Parameter(fb, requires_grad=False)
 
         # Spectrogram function (from Wav2LogFilterBank)
         if use_fft_mag:
@@ -405,66 +488,18 @@ class KaldiFbank(torch.nn.Module):
             f"KaldiFbank(sampling_rate={self.sampling_rate}, "
             f"num_filters={self.num_filters}, "
             f"frame_length={self.frame_length}, "
-            f"frame_shift={self.frame_shift})"
+            f"frame_shift={self._frame_shift})"
         )
 
     def __str__(self):
         return self.__repr__()
 
+    @property
+    def frame_shift(self) -> float:
+        return self._frame_shift
+
     def feature_dim(self) -> int:
         return self.num_filters
-
-    # ------------------------------------------------------------------
-    # Core processing (Wav2Win._forward_strided)
-    # ------------------------------------------------------------------
-
-    def _wav2win_forward_strided(self, x_strided: torch.Tensor):
-        if self.remove_dc_offset:
-            mu = torch.mean(x_strided, dim=2, keepdim=True)
-            x_strided = x_strided - mu
-
-        log_energy = None
-        if self.use_energy and self.raw_energy:
-            log_energy = _get_log_energy(x_strided, self.energy_floor)
-
-        if self.preemph_coeff != 0.0:
-            x_offset = torch.nn.functional.pad(x_strided, (1, 0), mode="replicate")
-            x_strided = x_strided - self.preemph_coeff * x_offset[:, :, :-1]
-
-        x_strided = x_strided * self._window
-
-        pad_length = self.fft_length
-        if pad_length != self._win_length:
-            pad = pad_length - self._win_length
-            x_strided = torch.nn.functional.pad(
-                x_strided.unsqueeze(1), [0, pad], mode="constant", value=0.0
-            ).squeeze(1)
-
-        if self.use_energy and not self.raw_energy:
-            log_energy = _get_log_energy(x_strided, self.energy_floor)
-
-        return x_strided, log_energy
-
-    # ------------------------------------------------------------------
-    # Core processing (Wav2LogFilterBank._forward_strided)
-    # ------------------------------------------------------------------
-
-    def _log_filter_bank_forward_strided(
-        self, x_strided: torch.Tensor, log_e: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        X = _rfft(x_strided)
-        pow_spec = self._to_spec(X)
-        pow_spec = torch.matmul(pow_spec, self._fb)
-        pow_spec = torch.max(pow_spec, self._eps).log()
-
-        if self.use_energy and log_e is not None:
-            pow_spec = torch.cat((log_e.unsqueeze(-1), pow_spec), dim=-1)
-
-        return pow_spec
-
-    # ------------------------------------------------------------------
-    # Core waveform → features (no input validation / conversion)
-    # ------------------------------------------------------------------
 
     def _extract_core(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, num_samples) on self._device"""
@@ -478,11 +513,45 @@ class KaldiFbank(torch.nn.Module):
             x, self._win_length, self._shift, self.snip_edges
         )
 
-        # Pre-emphasis, windowing, padding
-        x_strided, log_energy = self._wav2win_forward_strided(x_strided)
+        # Remove DC offset
+        if self.remove_dc_offset:
+            mu = torch.mean(x_strided, dim=2, keepdim=True)
+            x_strided = x_strided - mu
+
+        # Log energy (before pre-emphasis if raw_energy)
+        log_energy = None
+        if self.use_energy and self.raw_energy:
+            log_energy = _get_log_energy(x_strided, self.energy_floor)
+
+        # Pre-emphasis
+        if self.preemph_coeff != 0.0:
+            x_offset = torch.nn.functional.pad(x_strided, (1, 0), mode="replicate")
+            x_strided = x_strided - self.preemph_coeff * x_offset[:, :, :-1]
+
+        # Window
+        x_strided = x_strided * self._window
+
+        # Pad to FFT length
+        if self.fft_length != self._win_length:
+            pad = self.fft_length - self._win_length
+            x_strided = torch.nn.functional.pad(
+                x_strided.unsqueeze(1), [0, pad], mode="constant", value=0.0
+            ).squeeze(1)
+
+        # Log energy (after windowing if not raw_energy)
+        if self.use_energy and not self.raw_energy:
+            log_energy = _get_log_energy(x_strided, self.energy_floor)
 
         # FFT → mel filterbank → log
-        return self._log_filter_bank_forward_strided(x_strided, log_energy)
+        X = _rfft(x_strided)
+        pow_spec = self._to_spec(X)
+        pow_spec = torch.matmul(pow_spec, self._fb)
+        pow_spec = torch.max(pow_spec, self._eps).log()
+
+        if self.use_energy and log_energy is not None:
+            pow_spec = torch.cat((log_energy.unsqueeze(-1), pow_spec), dim=-1)
+
+        return pow_spec
 
     # ------------------------------------------------------------------
     # forward
@@ -522,6 +591,7 @@ class KaldiFbank(torch.nn.Module):
         else:
             return feats
 
+
 # ---------------------------------------------------------------------------
 # WhisperFbank  –  Whisper-style log-Mel spectrogram
 # ---------------------------------------------------------------------------
@@ -536,6 +606,40 @@ class KaldiFbank(torch.nn.Module):
 # module has zero dependency on whisper's assets/mel_filters.npz.
 
 
+def _hz_to_mel(frequencies):
+    """Convert Hz to Mels (Slaney Auditory Toolbox formula, matching librosa)."""
+    frequencies = np.asanyarray(frequencies)
+    f_min = 0.0
+    f_sp = 200.0 / 3
+    mels = (frequencies - f_min) / f_sp
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+    if frequencies.ndim:
+        log_t = frequencies >= min_log_hz
+        mels[log_t] = min_log_mel + np.log(frequencies[log_t] / min_log_hz) / logstep
+    elif frequencies >= min_log_hz:
+        mels = min_log_mel + np.log(frequencies / min_log_hz) / logstep
+    return mels
+
+
+def _mel_to_hz(mels):
+    """Convert Mels to Hz (Slaney Auditory Toolbox formula, matching librosa)."""
+    mels = np.asanyarray(mels)
+    f_min = 0.0
+    f_sp = 200.0 / 3
+    freqs = f_min + f_sp * mels
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+    if mels.ndim:
+        log_t = mels >= min_log_mel
+        freqs[log_t] = min_log_hz * np.exp(logstep * (mels[log_t] - min_log_mel))
+    elif mels >= min_log_mel:
+        freqs = min_log_hz * np.exp(logstep * (mels - min_log_mel))
+    return freqs
+
+
 def _whisper_mel_filters(
     n_mels: int,
     n_fft: int,
@@ -545,34 +649,29 @@ def _whisper_mel_filters(
 
     Returns a tensor of shape ``(n_mels, n_fft // 2 + 1)``.
     """
-    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-
     n_freqs = n_fft // 2 + 1
-
-    def hz_to_mel(f):
-        return 2595.0 * math.log10(1.0 + f / 700.0)
-
-    def mel_to_hz(m):
-        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
-
-    low_mel = hz_to_mel(0)
-    high_mel = hz_to_mel(sample_rate / 2)
-    mels = np.linspace(low_mel, high_mel, n_mels + 2)
-    hz = mel_to_hz(mels)
-
-    fft_freqs = np.linspace(0, sample_rate / 2, n_freqs)
+    fmax = float(sample_rate) / 2
 
     weights = np.zeros((n_mels, n_freqs), dtype=np.float32)
+
+    fftfreqs = np.linspace(0, fmax, n_freqs)
+    mel_f = _mel_to_hz(np.linspace(_hz_to_mel(0), _hz_to_mel(fmax), n_mels + 2))
+
+    fdiff = np.diff(mel_f)
+    ramps = np.subtract.outer(mel_f, fftfreqs)
+
     for i in range(n_mels):
-        f_left, f_center, f_right = hz[i], hz[i + 1], hz[i + 2]
-        up = (fft_freqs - f_left) / (f_center - f_left + 1e-10)
-        down = (f_right - fft_freqs) / (f_right - f_center + 1e-10)
-        weights[i] = np.maximum(0, np.minimum(up, down))
+        lower = -ramps[i] / fdiff[i]
+        upper = ramps[i + 2] / fdiff[i + 1]
+        weights[i] = np.maximum(0, np.minimum(lower, upper))
+
+    enorm = 2.0 / (mel_f[2 : n_mels + 2] - mel_f[:n_mels])
+    weights *= enorm[:, np.newaxis]
 
     return torch.from_numpy(weights)
 
 
-class WhisperFbank(torch.nn.Module):
+class WhisperFbank(FeatureExtractor):
     """Whisper-style log-Mel spectrogram extractor.
 
     Produces the same features as ``whisper.audio.log_mel_spectrogram``:
@@ -683,9 +782,7 @@ class WhisperFbank(torch.nn.Module):
                     samples = samples[0:1]
 
         device = self._mel_filters.device
-        feats = torch.stack(
-            [self._log_mel(wav.to(device)) for wav in samples]
-        )
+        feats = torch.stack([self._log_mel(wav.to(device)) for wav in samples])
 
         if is_numpy:
             return feats.cpu().numpy()
