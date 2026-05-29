@@ -546,6 +546,7 @@ class ATDataset(torch.utils.data.IterableDataset):
                     line = line.strip()
                     if not line:
                         continue
+                    line = line.split()[0]
                     if not os.path.exists(line):
                         logging.warning(
                             f"Noise audio tar file {line} does not exist, skipping."
@@ -1184,7 +1185,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             batch_size = len(raw_batch_output["audio"])
             batch_output = {}
             for k in raw_batch_output:
-                if len(raw_batch_output[k]) != batch_size:
+                if len(raw_batch_output[k]) != batch_size and k not in ("mp3", "flac", "wav"):
                     logging.warning(
                         f"Inconsistent batch size for key {k}, expected {batch_size} "
                         f"but got {len(raw_batch_output[k])}, please check all data samples "
