@@ -43,6 +43,13 @@ try:
 except ImportError:
     Fbank = KaldiFbank = WhisperFbank = None
 
+# Mapping from feature_type string to extractor class
+_FEATURE_TYPE_MAP = {
+    "Fbank": Fbank,
+    "KaldiFbank": KaldiFbank,
+    "WhisperFbank": WhisperFbank,
+}
+
 
 def fix_sample_key(sample):
     """
@@ -400,6 +407,14 @@ class ATDataset(torch.utils.data.IterableDataset):
                 Tuple of (probability, lower_db, upper_db) for volume perturbation.
             feature_extractor:
                 Feature extractor to extract features from raw audio.
+                If provided, takes priority over feature_type.
+            feature_type:
+                Type of feature to extract when feature_extractor is not provided.
+                Supported types: "Fbank", "KaldiFbank", "WhisperFbank".
+                A default extractor with the given type will be created using
+                the specified sample_rate. Default is "Fbank".
+                If neither feature_extractor nor feature_type is provided,
+                no feature extraction is performed.
             num_copies:
                 Number of copies of samples in one batch with different augmentations.
             buffer_size:
@@ -578,6 +593,28 @@ class ATDataset(torch.utils.data.IterableDataset):
         )
 
         self.sample_rate = sample_rate
+        self.feature_type = feature_type
+
+        # Resolve feature extractor with priority:
+        #   1. user-provided feature_extractor
+        #   2. built-in extractor created from feature_type
+        #   3. None (no feature extraction)
+        if feature_extractor is not None:
+            pass  # use the provided extractor as-is
+        elif feature_type is not None:
+            if feature_type not in _FEATURE_TYPE_MAP:
+                raise ValueError(
+                    f"Unsupported feature_type: '{feature_type}'. "
+                    f"Supported types: {list(_FEATURE_TYPE_MAP.keys())}"
+                )
+            extractor_cls = _FEATURE_TYPE_MAP[feature_type]
+            if extractor_cls is None:
+                raise ImportError(
+                    f"Feature extractor '{feature_type}' is not available. "
+                    f"Please install the required dependencies."
+                )
+            feature_extractor = extractor_cls(sample_rate=sample_rate)
+
         if feature_extractor is not None:
             feature_extractor = feature_extractor.to(device)
         else:
@@ -1285,11 +1322,15 @@ class ATDataloader(wds.WebLoader):
                 Function to map samples, used when creating datasets from string manifests.
             feature_type:
                 Type of feature to extract, used when creating datasets from string manifests.
-                Using the internal feature extractor, only used when feature_extractor
-                is not provided. If feature_extractor is provided, this argument will be ignored. Default is "fbank".
+                Supported types: "Fbank", "KaldiFbank", "WhisperFbank".
+                A default extractor with the given type will be created.
+                Only used when feature_extractor is not provided.
+                If feature_extractor is provided, this argument will be ignored.
+                If neither is provided, no feature extraction is performed.
+                Default is "Fbank".
             feature_extractor:
                 Feature extractor to extract features from raw audio, used when creating datasets
-                from string manifests.
+                from string manifests. Takes priority over feature_type.
             use_noise_augment:
                 Whether to use noise augmentation, used when creating datasets from string manifests.
             noise_manifest:
