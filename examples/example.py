@@ -16,27 +16,66 @@
 # limitations under the License.
 
 
-from atdataset import ATDataloader, Fbank
-from tqdm import tqdm
+"""
+Example script demonstrating how to use ATDataloader.
+
+Usage:
+    # Basic: batch_size mode with 2 datasets
+    python example.py \
+        --datasets data/tars/aishell_train.lst data/tars/aishell2_train.lst \
+        --sample-rate 16000 \
+        --batch-size 32
+
+    # max_duration mode with noise augmentation
+    python example.py \
+        --datasets data/tars/aishell_train.lst data/tars/aishell2_train.lst \
+        --sample-rate 16000 \
+        --max-duration 100.0 \
+        --max-samples 100 \
+        --use-noise-augment \
+        --noise-manifest data/tars/musan.lst \
+        --use-speed-perturb \
+        --use-volume-perturb \
+        --num-copies 2
+
+    # Use KaldiFbank feature extractor
+    python example.py \
+        --datasets data/tars/aishell_train.lst \
+        --sample-rate 16000 \
+        --batch-size 64 \
+        --feature-type KaldiFbank
+
+    # No feature extraction
+    python example.py \
+        --datasets data/tars/aishell_train.lst \
+        --sample-rate 16000 \
+        --batch-size 64 \
+        --feature-type none
+
+    # Test mode
+    python example.py \
+        --datasets data/tars/aishell_test.lst \
+        --sample-rate 16000 \
+        --batch-size 1 \
+        --is-test
+"""
+
+import argparse
 import logging
-import torch
 import time
-from functools import partial
 
+import torch
 import torch.multiprocessing as mp
+from tqdm import tqdm
 
-from ssentencepiece import Ssentencepiece
+from atdataset import ATDataloader
 
 
 def filter_func(sample):
+    """Filter out samples shorter than 5 seconds."""
     if sample["audio"].size(1) < 16000 * 5:
         return False
     return True
-
-
-def map_func(sample, sp):
-    sample["tokens"] = sp.encode(sample["text"])
-    return sample
 
 
 def worker_init_fn(worker_id):
@@ -46,35 +85,178 @@ def worker_init_fn(worker_id):
     )
 
 
+def get_args():
+    parser = argparse.ArgumentParser(
+        description="ATDataloader example script",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ---- Dataset ----
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        required=True,
+        help="Manifest file paths for the datasets.",
+    )
+
+    # ---- Audio ----
+    parser.add_argument(
+        "--sample-rate", type=int, default=16000,
+        help="Target sample rate for audio.",
+    )
+
+    # ---- Batching ----
+    parser.add_argument(
+        "--max-duration", type=float, default=600.0,
+        help="Maximum duration (in seconds) for each batch.",
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=None,
+        help="Maximum number of samples for each batch.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Fixed batch size. When specified, max_duration and max_samples are ignored.",
+    )
+    parser.add_argument(
+        "--epoch-hours", type=float, default=None,
+        help="Number of hours per epoch. If None, calculated from manifest durations.",
+    )
+    parser.add_argument(
+        "--mux-weights", nargs="+", type=float, default=None,
+        help="Weights for each dataset for muxing. If None, calculated from durations.",
+    )
+    parser.add_argument(
+        "--mux-intra-batch", action="store_true", default=True,
+        help="Mix samples from different datasets within the same batch.",
+    )
+    parser.add_argument(
+        "--no-mux-intra-batch", dest="mux_intra_batch", action="store_false",
+        help="Disable intra-batch muxing (mux per batch instead).",
+    )
+    parser.add_argument(
+        "--num-buckets", type=int, default=30,
+        help="Number of buckets for bucketing variable length audio samples.",
+    )
+
+    # ---- Sample length filter ----
+    parser.add_argument(
+        "--min-length", type=float, default=0.1,
+        help="Minimum length (in seconds) of samples to consider.",
+    )
+    parser.add_argument(
+        "--max-length", type=float, default=60.0,
+        help="Maximum length (in seconds) of samples to consider.",
+    )
+
+    # ---- Feature ----
+    parser.add_argument(
+        "--feature-type", type=str, default=None,
+        choices=["Fbank", "KaldiFbank", "WhisperFbank", "none"],
+        help="Type of feature to extract. Use 'none' to disable feature extraction.",
+    )
+
+    # ---- Augmentation ----
+    parser.add_argument(
+        "--use-noise-augment", action="store_true", default=False,
+        help="Enable noise augmentation.",
+    )
+    parser.add_argument(
+        "--noise-manifest", type=str, default=None,
+        help="Manifest file containing noise audio tars.",
+    )
+    parser.add_argument(
+        "--noise-augment", nargs=3, type=float, default=[0.5, 10, 20],
+        metavar=("PROB", "LOWER_DB", "UPPER_DB"),
+        help="Noise augmentation params: probability, lower_snr_db, upper_snr_db.",
+    )
+    parser.add_argument(
+        "--use-speed-perturb", action="store_true", default=False,
+        help="Enable speed perturbation.",
+    )
+    parser.add_argument(
+        "--speed-perturb", nargs="+", type=float, default=[0.9, 1.0, 1.1],
+        help="Speeds for speed perturbation.",
+    )
+    parser.add_argument(
+        "--use-volume-perturb", action="store_true", default=False,
+        help="Enable volume perturbation.",
+    )
+    parser.add_argument(
+        "--volume-perturb", nargs=3, type=float, default=[0.5, -10, 6],
+        metavar=("PROB", "LOWER_DB", "UPPER_DB"),
+        help="Volume perturbation params: probability, lower_db, upper_db.",
+    )
+
+    # ---- Data loading ----
+    parser.add_argument(
+        "--num-copies", type=int, default=1,
+        help="Number of copies of samples with different augmentations.",
+    )
+    parser.add_argument(
+        "--buffer-size", type=int, default=1000,
+        help="Buffer size for shuffling.",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=4,
+        help="Number of workers for dataloader.",
+    )
+    parser.add_argument(
+        "--prefetch-factor", type=int, default=2,
+        help="Prefetch factor for dataloader.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for reproducibility.",
+    )
+
+    # ---- Misc ----
+    parser.add_argument(
+        "--is-test", action="store_true", default=False,
+        help="Run in test mode (no shuffling, no augmentation).",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cpu",
+        help="Device for feature computation (e.g. 'cpu' or 'cuda:0').",
+    )
+
+    return parser.parse_args()
+
+
 def main():
-    feature_extractor = Fbank(sample_rate=16000)
-    mux_weights = [1350, 2000]
-    sp = Ssentencepiece("librispeech-500")
-    _map_func = partial(map_func, sp=sp)
+    args = get_args()
+
+    # Resolve feature_type: "none" → None
+    feature_type = args.feature_type if args.feature_type != "none" else None
+
     dl = ATDataloader(
-        datasets=[
-            "data/tars/aishell_train.lst",
-            "data/tars/aishell2_train.lst",
-        ],
-        max_duration=100.0,
-        max_samples=100,
-        batch_size=32,
-        epoch_hours=sum(mux_weights),
-        mux_weights=None,
-        mux_intra_batch=True,
-        feature_extractor=feature_extractor,
+        datasets=args.datasets,
+        sample_rate=args.sample_rate,
+        max_duration=args.max_duration,
+        max_samples=args.max_samples,
+        batch_size=args.batch_size,
+        epoch_hours=args.epoch_hours,
+        mux_weights=args.mux_weights,
+        mux_intra_batch=args.mux_intra_batch,
+        min_length=args.min_length,
+        max_length=args.max_length,
+        feature_type=feature_type,
+        use_noise_augment=args.use_noise_augment,
+        noise_manifest=args.noise_manifest,
+        noise_augment=tuple(args.noise_augment),
+        use_speed_perturb=args.use_speed_perturb,
+        speed_perturb=tuple(args.speed_perturb),
+        use_volume_perturb=args.use_volume_perturb,
+        volume_perturb=tuple(args.volume_perturb),
+        num_copies=args.num_copies,
+        buffer_size=args.buffer_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        seed=args.seed,
+        num_buckets=args.num_buckets,
+        is_test=args.is_test,
         filter_func=filter_func,
-        map_func=_map_func,
-        sample_rate=16000,
-        num_copies=2,
-        use_noise_augment=True,
-        noise_manifest="data/tars/musan.lst",
-        use_speed_perturb=True,
-        use_volume_perturb=True,
-        buffer_size=500,
-        num_workers=0,
-        worker_init_fn=worker_init_fn,
-        device=torch.device("cpu"),
+        device=torch.device(args.device),
     )
 
     logging.info(f"Dataloader initialized: {dl}.")
@@ -82,7 +264,8 @@ def main():
     start = time.time()
     for i, batch in enumerate(tqdm(dl, total=len(dl))):
         logging.info(f"Batch {i}: ids={batch['ids']}")
-        pass
+    elapsed = time.time() - start
+    logging.info(f"Finished {i + 1} batches in {elapsed:.2f}s.")
 
 
 if __name__ == "__main__":
