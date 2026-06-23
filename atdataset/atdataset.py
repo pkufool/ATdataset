@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright  2025-2026 Wei Kang (wkang@pku.edu.cn)
 #
-# See ../../../../LICENSE for clarification regarding multiple authors
+# See ../LICENSE for clarification regarding multiple authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,6 +49,15 @@ _FEATURE_TYPE_MAP = {
     "KaldiFbank": KaldiFbank,
     "WhisperFbank": WhisperFbank,
 }
+
+def fix_random_seed(random_seed: int):
+    """
+    Set the same random seed for the libraries and modules that zipformer interacts with.
+    Includes the ``random`` module, numpy, torch.
+    """
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    torch.random.manual_seed(random_seed)
 
 
 def fix_sample_key(sample):
@@ -1470,18 +1479,14 @@ class ATDataloader(wds.WebLoader):
 
         if seed is not None:
             # Seed the main process eagerly so single-process / is_test mode is also reproducible.
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+            fix_random_seed(seed)
 
             _user_init = worker_init_fn
             _seed = seed
 
             def _worker_init_fn(worker_id: int):
                 worker_seed = _seed + worker_id
-                random.seed(worker_seed)
-                np.random.seed(worker_seed)
-                torch.manual_seed(worker_seed)
+                fix_random_seed(worker_seed)
                 if _user_init is not None:
                     _user_init(worker_id)
 
