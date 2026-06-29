@@ -383,7 +383,6 @@ class ATDataset(torch.utils.data.IterableDataset):
         buffer_size: int = 1000,
         is_test: bool = False,
         need_num_samples: bool = False,
-        device=torch.device("cpu"),
     ):
         """
         Args:
@@ -429,14 +428,11 @@ class ATDataset(torch.utils.data.IterableDataset):
                 Buffer size for shuffling.
             is_test:
                 Whether the dataset is for training or not.
-            device:
-                Device to calculate features.
             need_num_samples:
                 Whether to calculate the number of samples in the dataset.
         """
         super().__init__()
 
-        self.device = device
         self.is_test = is_test
         self.buffer_size = buffer_size
         self.min_length = min_length
@@ -624,10 +620,6 @@ class ATDataset(torch.utils.data.IterableDataset):
                 )
             feature_extractor = extractor_cls(sample_rate=sample_rate)
 
-        if feature_extractor is not None:
-            feature_extractor = feature_extractor.to(device)
-        else:
-            self.device = "cpu"
         self.feature_extractor = feature_extractor
 
     def __str__(self):
@@ -643,7 +635,7 @@ class ATDataset(torch.utils.data.IterableDataset):
             f"use_noise_augment={self.use_noise_augment}, noise_augment={self.noise_augment}, "
             f"noise_manifest={self.noise_manifest}, feature_extractor={self.feature_extractor}, "
             f"filter_func={self.filter_func}, map_func={self.map_func}, num_copies={self.num_copies}, "
-            f"is_test={self.is_test}, device={self.device})"
+            f"is_test={self.is_test})"
         )
 
     # __iter__ runs on child process, while __init__ runs on main process
@@ -654,11 +646,10 @@ class ATDataset(torch.utils.data.IterableDataset):
         noise_sampler = None
         if self.noise_tars:
             noise_tars = list(self.noise_tars)
-            tar_indexs = list(range(len(noise_tars)))
             pad_num = total_num_workers - (len(noise_tars) % total_num_workers)
             if pad_num != total_num_workers:
                 for i in range(pad_num):
-                    noise_tars.append(noise_tars[random.choice(tar_indexs)])
+                    noise_tars.append(noise_tars[i % len(self.noise_tars)])
             noise_tars = sorted(noise_tars)
             noise_ds = AudioDataset(
                 noise_tars,
@@ -679,11 +670,10 @@ class ATDataset(torch.utils.data.IterableDataset):
 
         # pad audio_tars to be multiple of num_workers (for proper sharding)
         audio_tars = list(self.audio_tars)
-        tar_indexs = list(range(len(audio_tars)))
         pad_num = total_num_workers - (len(audio_tars) % total_num_workers)
         if pad_num != total_num_workers:
             for i in range(pad_num):
-                audio_tars.append(audio_tars[random.choice(tar_indexs)])
+                audio_tars.append(audio_tars[i % len(self.audio_tars)])
         audio_tars = sorted(audio_tars)
 
         dataset = (
@@ -748,13 +738,11 @@ class ATDataset(torch.utils.data.IterableDataset):
                     audio = self.add_noise(audio)
                 sample_copy["audio"] = audio
 
-                feature = None
                 if self.feature_extractor is not None:
                     with torch.no_grad():
                         feature = self.feature_extractor(
-                            audio.to(self.device), sample_rate=self.sample_rate
-                        ).cpu()
-                if feature is not None:
+                            audio, sample_rate=self.sample_rate
+                        )
                     sample_copy["feature"] = feature
                 samples.append(sample_copy)
             yield samples if self.num_copies > 1 else samples[0]
@@ -832,9 +820,9 @@ class StreamingBucketBatcher:
             ), (
                 f"When mux_intra_batch is True, min_length and max_length should be single float values."
             )
-            self.buckets = collections.defaultdict(collections.deque)
+            bucket_width = (max_length - min_length) / num_buckets
             self.bucket_item_lengths = [
-                math.ceil((max_length - max(1, min_length)) / num_buckets) * (i + 1)
+                min_length + (i + 0.5) * bucket_width
                 for i in range(num_buckets)
             ]
         else:
@@ -842,9 +830,6 @@ class StreamingBucketBatcher:
                 logging.info(
                     f"Using StreamingBucketBatcher without inter-batch muxing and weights: {self.weights}"
                 )
-            self.buckets = [
-                collections.defaultdict(collections.deque) for _ in range(len(weights))
-            ]
             self.bucket_item_lengths = []
             assert (
                 isinstance(self.min_length, list)
@@ -854,13 +839,13 @@ class StreamingBucketBatcher:
                 f"When mux_intra_batch is False, min_length and max_length should be lists with the same length as weights."
             )
             for i in range(len(weights)):
-                min_length = self.min_length[i]
-                max_length = self.max_length[i]
+                min_len = self.min_length[i]
+                max_len = self.max_length[i]
+                bw = (max_len - min_len) / num_buckets
                 self.bucket_item_lengths.append(
                     [
-                        math.ceil((max_length - max(1, min_length)) / num_buckets)
-                        * (i + 1)
-                        for i in range(num_buckets)
+                        min_len + (j + 0.5) * bw
+                        for j in range(num_buckets)
                     ]
                 )
 
@@ -877,6 +862,14 @@ class StreamingBucketBatcher:
         streams = [iter(data_stream) for data_stream in data_streams]
         weights = self.weights
 
+        if self.mux_intra_batch:
+            buckets = collections.defaultdict(collections.deque)
+        else:
+            buckets = [
+                collections.defaultdict(collections.deque)
+                for _ in range(len(weights))
+            ]
+
         stream_idx = 0
         while True:
             # Fill buckets
@@ -885,14 +878,14 @@ class StreamingBucketBatcher:
                 if self.mux_intra_batch:
                     while True:
                         if self.batch_size is not None:
-                            if len(self.buckets[0]) > self.batch_size:
+                            if len(buckets[0]) > self.batch_size:
                                 full_buckets = [0]
                                 break
                         else:
                             full_buckets = [
                                 i
                                 for i in range(self.num_buckets)
-                                if self.bucket_item_lengths[i] * len(self.buckets[i])
+                                if self.bucket_item_lengths[i] * len(buckets[i])
                                 > self.max_duration * 1.5
                             ]
                             if full_buckets:
@@ -905,12 +898,12 @@ class StreamingBucketBatcher:
                             sample = samples
                         length = sample[self.length_key].size(1) / self.sample_rate
                         b_id = self.bucket_id(length, self.min_length, self.max_length)
-                        self.buckets[b_id].append(samples)
+                        buckets[b_id].append(samples)
                 else:
                     stream_idx = np.random.choice(len(streams), p=weights)
                     while True:
                         if self.batch_size is not None:
-                            if len(self.buckets[stream_idx]) > self.batch_size:
+                            if len(buckets[stream_idx]) > self.batch_size:
                                 full_buckets = [0]
                                 break
                         else:
@@ -918,7 +911,7 @@ class StreamingBucketBatcher:
                                 i
                                 for i in range(self.num_buckets)
                                 if self.bucket_item_lengths[stream_idx][i]
-                                * len(self.buckets[stream_idx][i])
+                                * len(buckets[stream_idx][i])
                                 > self.max_duration * 1.5
                             ]
                             if full_buckets:
@@ -934,7 +927,7 @@ class StreamingBucketBatcher:
                             self.min_length[stream_idx],
                             self.max_length[stream_idx],
                         )
-                        self.buckets[stream_idx][b_id].append(samples)
+                        buckets[stream_idx][b_id].append(samples)
             except StopIteration:
                 if not self.is_test:
                     # repeat the data stream, the BatchedDataset will handle epoch ending
@@ -949,9 +942,9 @@ class StreamingBucketBatcher:
                 bucket_range.append(random.choice(full_buckets))
             elif self.is_test:
                 # Flush remaining samples from all non-empty buckets (longest first)
-                buckets = self.buckets if self.mux_intra_batch else self.buckets[stream_idx]
+                active_buckets = buckets if self.mux_intra_batch else buckets[stream_idx]
                 bucket_range = [
-                    i for i in range(self.num_buckets) if buckets[i]
+                    i for i in range(self.num_buckets) if active_buckets[i]
                 ]
                 bucket_range.reverse()
 
@@ -961,14 +954,14 @@ class StreamingBucketBatcher:
             max_sample_length = 0
             batch = []
 
-            buckets = self.buckets if self.mux_intra_batch else self.buckets[stream_idx]
+            active_buckets = buckets if self.mux_intra_batch else buckets[stream_idx]
             for b_id in bucket_range:
-                while buckets[b_id]:
+                while active_buckets[b_id]:
                     if self.batch_size is not None and num_samples >= self.batch_size:
                         break
                     if num_samples >= self.max_samples and self.batch_size is None:
                         break
-                    samples = buckets[b_id][0]
+                    samples = active_buckets[b_id][0]
                     if isinstance(samples, list):
                         sample = samples[0]
                     else:
@@ -986,7 +979,7 @@ class StreamingBucketBatcher:
                             num_samples = 1
                         break
                     else:
-                        batch.append(buckets[b_id].popleft())
+                        batch.append(active_buckets[b_id].popleft())
                         if length > max_sample_length:
                             max_sample_length = length
                         num_samples += 1
@@ -1000,8 +993,8 @@ class StreamingBucketBatcher:
             if not batch:
                 # Has full buckets but could not form a batch within max_duration
                 # If a single sample exceeds batch_frames, yield it alone
-                if last_b_id is not None and buckets[last_b_id]:
-                    batch.append(buckets[last_b_id].popleft())
+                if last_b_id is not None and active_buckets[last_b_id]:
+                    batch.append(active_buckets[last_b_id].popleft())
                 else:
                     if self.is_test:
                         return
@@ -1022,7 +1015,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         num_copies: int = 1,
         is_test: bool = False,
         num_buckets: int = 30,
-        device: torch.device = torch.device("cpu"),
+        fill_factor: float = 1.2,
     ):
         """
         Batched dataset that combines multiple ATDatasets with streaming bucketing and optional intra-batch muxing.
@@ -1054,8 +1047,12 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             Whether the dataset is for training or not. Default is False.
           num_buckets:
             Number of buckets to use for streaming bucketing. Default is 30.
-          device:
-            Device to calculate features. Default is CPU.
+          fill_factor:
+            Correction factor for epoch batch count estimation. Batches are
+            typically not fully packed to max_duration due to bucketing
+            constraints, so the actual number of batches per epoch is higher
+            than the naive estimate. Default is 1.2 (i.e. ~83% average fill).
+            Use examples/example.py to measure the true value for your data.
         """
         super().__init__()
         self.sample_rate = sample_rate
@@ -1065,7 +1062,6 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         self.num_buckets = num_buckets
         self.mux_intra_batch = mux_intra_batch
         self.num_copies = num_copies
-        self.device = device
         self.batch_size = batch_size
 
         if isinstance(datasets, ATDataset):
@@ -1154,6 +1150,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         else:
             self.epoch_batches_per_node = math.ceil(
                 self.epoch_hours * 3600.0 / world_size / self.max_duration
+                * fill_factor
             )
 
     def __str__(self):
@@ -1164,7 +1161,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             f"BatchedDataset(sample_rate={self.sample_rate}, max_duration={self.max_duration}, "
             f"max_samples={self.max_samples}, batch_size={self.batch_size}, epoch_hours={self.epoch_hours:.2f}, "
             f"mux_weights={self.mux_weights}, num_copies={self.num_copies}, mux_intra_batch={self.mux_intra_batch}, "
-            f"is_test={self.is_test}, num_buckets={self.num_buckets}, device={self.device}, "
+            f"is_test={self.is_test}, num_buckets={self.num_buckets}, "
             f"datasets={self.datasets})"
         )
 
@@ -1258,7 +1255,16 @@ class BatchedDataset(torch.utils.data.IterableDataset):
                         padding_value=math.log(1e-10),
                     )
                     continue
-                batch_output[k] = raw_batch_output[k]
+                values = raw_batch_output[k]
+                if isinstance(values[0], torch.Tensor) and values[0].dim() >= 1:
+                    batch_output[f"{k}_lens"] = torch.tensor(
+                        [v.size(0) for v in values]
+                    )
+                    batch_output[k] = torch.nn.utils.rnn.pad_sequence(
+                        values, batch_first=True
+                    )
+                else:
+                    batch_output[k] = values
             batch_count += 1
             yield batch_output
 
@@ -1294,8 +1300,8 @@ class ATDataloader(wds.WebLoader):
         seed: Optional[int] = None,
         mux_intra_batch: bool = True,
         num_buckets: int = 30,
+        fill_factor: float = 1.2,
         is_test: bool = False,
-        device: torch.device = torch.device("cpu"),
     ):
         """
         Create a dataloader for streaming webdataset that supports multiple datasets with
@@ -1374,19 +1380,24 @@ class ATDataloader(wds.WebLoader):
                 When None, no seeding is applied and behaviour is non-deterministic.
             num_buckets:
                 Number of buckets for bucketing variable length audio samples.
+            fill_factor:
+                Correction factor for epoch batch count estimation. Due to
+                bucketing constraints, batches are typically not fully packed.
+                Default 1.2 means ~83% average fill. Measure the true value
+                with examples/example.py and adjust accordingly.
             is_test:
                 Whether the dataloader is for testing or not, for training and validation, set is_test to False
                 to enable shuffling and data augmentation.
             mux_intra_batch:
                 If True, mux at sample level (intra-batch). If False, mux per batch.
-            device:
-                Device to calculate features and doing augmentation, used when creating datasets from string manifests.
-                Note: All returned tensors will be on CPU, the device is only used for intermediate calculation.
         """
 
         if not isinstance(datasets, list):
             datasets = [datasets]
 
+        # When num_copies > 1, each raw sample produces num_copies augmented
+        # variants in the final batch. Scale down the batching budget so the
+        # total batch size after expansion matches what the user requested.
         max_duration = max_duration / num_copies if max_duration is not None else None
         max_samples = max_samples // num_copies if max_samples is not None else None
         batch_size = batch_size // num_copies if batch_size is not None else None
@@ -1414,7 +1425,6 @@ class ATDataloader(wds.WebLoader):
                     num_copies=num_copies,
                     is_test=is_test,
                     need_num_samples=batch_size is not None,
-                    device=device,
                 )
                 atdatasets.append(atds)
             else:
@@ -1426,9 +1436,6 @@ class ATDataloader(wds.WebLoader):
                 )
                 assert ds.num_copies == num_copies, (
                     f"Dataset num_copies {ds.num_copies} does not match dataloader num_copies {num_copies}"
-                )
-                assert ds.device == device, (
-                    f"Dataset device {ds.device} does not match dataloader device {device}"
                 )
                 assert ds.is_test == is_test, (
                     f"Dataset is_test {ds.is_test} does not match dataloader is_test {is_test}"
@@ -1467,8 +1474,8 @@ class ATDataloader(wds.WebLoader):
             num_copies=num_copies,
             mux_intra_batch=mux_intra_batch,
             num_buckets=num_buckets,
+            fill_factor=fill_factor,
             is_test=is_test,
-            device=device,
         )
 
         self.seed = seed

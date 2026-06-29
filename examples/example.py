@@ -215,10 +215,6 @@ def get_args():
         "--is-test", action="store_true", default=False,
         help="Run in test mode (no shuffling, no augmentation).",
     )
-    parser.add_argument(
-        "--device", type=str, default="cpu",
-        help="Device for feature computation (e.g. 'cpu' or 'cuda:0').",
-    )
 
     return parser.parse_args()
 
@@ -256,16 +252,37 @@ def main():
         num_buckets=args.num_buckets,
         is_test=args.is_test,
         filter_func=filter_func,
-        device=torch.device(args.device),
     )
 
     logging.info(f"Dataloader initialized: {dl}.")
 
     start = time.time()
+    total_batch_duration = 0.0
+    num_batches = 0
     for i, batch in enumerate(tqdm(dl, total=len(dl))):
         logging.info(f"Batch {i}: ids={batch['ids']}")
+        # Measure actual batch duration for fill_factor estimation
+        if "audio" in batch and "audio_lens" in batch:
+            batch_dur = batch["audio_lens"].sum().item() / args.sample_rate
+            total_batch_duration += batch_dur
+            num_batches += 1
     elapsed = time.time() - start
     logging.info(f"Finished {i + 1} batches in {elapsed:.2f}s.")
+
+    # Report fill_factor: ratio of actual batch duration to max_duration.
+    # Use this value as the fill_factor when setting epoch_hours to get
+    # more accurate epoch length estimation:
+    #   epoch_batches ≈ epoch_hours * 3600 / max_duration / fill_factor
+    if num_batches > 0 and args.max_duration and args.batch_size is None:
+        avg_batch_duration = total_batch_duration / num_batches
+        fill_factor = avg_batch_duration / args.max_duration
+        logging.info(
+            f"Fill factor estimation: {fill_factor:.3f} "
+            f"(avg_batch_duration={avg_batch_duration:.1f}s, "
+            f"max_duration={args.max_duration:.1f}s). "
+            f"Recommended: set epoch_hours = actual_hours / {fill_factor:.3f} "
+            f"for more accurate epoch length."
+        )
 
 
 if __name__ == "__main__":
