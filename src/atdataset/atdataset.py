@@ -39,10 +39,11 @@ from webdataset.utils import pytorch_worker_info
 
 try:
     from atdataset.feature import Fbank, KaldiFbank, WhisperFbank
-except ImportError:
-    Fbank = KaldiFbank = WhisperFbank = None
+except (ImportError, ModuleNotFoundError):
+    # feature module is optional — this file can be used standalone without it.
+    # Feature extraction via feature_type will raise a clear error at runtime.
+    Fbank = KaldiFbank = WhisperFbank = None  # type: ignore[assignment, misc]
 
-# Mapping from feature_type string to extractor class
 _FEATURE_TYPE_MAP = {
     "Fbank": Fbank,
     "KaldiFbank": KaldiFbank,
@@ -77,13 +78,13 @@ def fix_sample_key(sample):
     return new_sample
 
 
-def load_audio(data, sample_rate: int = 16000, device="cpu"):
+def load_audio(data, sample_rate: int = 16000):
     """
     Load audio from bytes data and resample to the target sample rate if needed.
-    Return a tensor of shape (1, num_samples)
+    Return a tensor of shape (1, num_samples) on CPU.
     """
     audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
-    audio = torch.tensor(audio, device=device)
+    audio = torch.from_numpy(audio)
     if audio.size(1) > 1:
         audio = torch.mean(audio, dim=1, keepdim=True)
     audio = audio.permute(1, 0)
@@ -291,14 +292,13 @@ class LabelDataset:
             {"audio_filepath": "filepath.{wav,mp3,flac}", "text": "transcription text"}
         """
         self._labels = {}
+        self.path = manifest_path
 
         # if the manifest file does not exist, return empty labels
         # for some non speech audios.
         if not os.path.exists(manifest_path):
             logging.warning(f"Label manifest file {manifest_path} does not exist.")
             return
-
-        self.path = manifest_path
         with open(manifest_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -460,8 +460,9 @@ class ATDataset(torch.utils.data.IterableDataset):
             if os.environ.get("RANK") is None:
                 os.environ["RANK"] = str(dist.get_rank())
             if os.environ.get("LOCAL_RANK") is None:
+                num_devices = torch.cuda.device_count() or 1
                 os.environ["LOCAL_RANK"] = str(
-                    dist.get_rank() % torch.cuda.device_count()
+                    dist.get_rank() % num_devices
                 )
 
         labels_to_audios: Dict[str, str] = {}
@@ -652,14 +653,15 @@ class ATDataset(torch.utils.data.IterableDataset):
 
         noise_sampler = None
         if self.noise_tars:
-            tar_indexs = list(range(len(self.noise_tars)))
-            pad_num = total_num_workers - (len(self.noise_tars) % total_num_workers)
+            noise_tars = list(self.noise_tars)
+            tar_indexs = list(range(len(noise_tars)))
+            pad_num = total_num_workers - (len(noise_tars) % total_num_workers)
             if pad_num != total_num_workers:
                 for i in range(pad_num):
-                    self.noise_tars.append(self.noise_tars[random.choice(tar_indexs)])
-            self.noise_tars = sorted(self.noise_tars)
+                    noise_tars.append(noise_tars[random.choice(tar_indexs)])
+            noise_tars = sorted(noise_tars)
             noise_ds = AudioDataset(
-                self.noise_tars,
+                noise_tars,
                 sample_rate=self.sample_rate,
                 buffer_size=self.buffer_size,
                 nodesplitter=wds.split_by_node,
@@ -738,8 +740,8 @@ class ATDataset(torch.utils.data.IterableDataset):
 
             samples = []
             for _ in range(self.num_copies):
-                sample_copy = copy.deepcopy(sample)
-                audio = sample["audio"]
+                sample_copy = dict(sample)
+                audio = sample["audio"].clone()
                 if not self.is_test:
                     audio = self.augment_audio(audio)
                 if not self.is_test and random.random() < self.noise_prob:
@@ -938,19 +940,20 @@ class StreamingBucketBatcher:
                     # repeat the data stream, the BatchedDataset will handle epoch ending
                     streams[stream_idx] = iter(data_streams[stream_idx])
                     continue
+                # Test mode: stream exhausted, flush all remaining buffered samples
+                # by treating every non-empty bucket as ready.
 
             bucket_range = []
 
             if full_buckets:
                 bucket_range.append(random.choice(full_buckets))
-            else:
-                # Normally, if self.is_test is False, will not run into this branch
-                if self.is_test:
-                    # all non-empty buckets
-                    bucket_range = [
-                        i for i in range(self.num_buckets) if self.buckets[i]
-                    ]
-                    bucket_range.reverse()
+            elif self.is_test:
+                # Flush remaining samples from all non-empty buckets (longest first)
+                buckets = self.buckets if self.mux_intra_batch else self.buckets[stream_idx]
+                bucket_range = [
+                    i for i in range(self.num_buckets) if buckets[i]
+                ]
+                bucket_range.reverse()
 
             last_b_id = bucket_range[0] if bucket_range else None
 
@@ -997,7 +1000,7 @@ class StreamingBucketBatcher:
             if not batch:
                 # Has full buckets but could not form a batch within max_duration
                 # If a single sample exceeds batch_frames, yield it alone
-                if last_b_id and buckets[last_b_id]:
+                if last_b_id is not None and buckets[last_b_id]:
                     batch.append(buckets[last_b_id].popleft())
                 else:
                     if self.is_test:
@@ -1470,6 +1473,7 @@ class ATDataloader(wds.WebLoader):
 
         self.seed = seed
         self.num_copies = num_copies
+        self._epoch = 0
 
         self.dataset = batched_dataset
         self.epoch_batches = batched_dataset.epoch_batches_per_node
@@ -1477,19 +1481,24 @@ class ATDataloader(wds.WebLoader):
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
 
         if seed is not None:
-            # Seed the main process eagerly so single-process / is_test mode is also reproducible.
             fix_random_seed(seed)
 
             _user_init = worker_init_fn
             _seed = seed
+            # Use a mutable container so the closure captures the current epoch
+            # at iteration time rather than at construction time.
+            _epoch_ref = [0]
+            self._epoch_ref = _epoch_ref
 
             def _worker_init_fn(worker_id: int):
-                worker_seed = _seed + worker_id
+                worker_seed = _seed + worker_id + _epoch_ref[0] * 10000
                 fix_random_seed(worker_seed)
                 if _user_init is not None:
                     _user_init(worker_id)
 
             worker_init_fn = _worker_init_fn
+        else:
+            self._epoch_ref = None
 
         super().__init__(
             batched_dataset,
@@ -1514,5 +1523,8 @@ class ATDataloader(wds.WebLoader):
         return self.epoch_batches
 
     def __iter__(self):
+        if self._epoch_ref is not None:
+            self._epoch_ref[0] = self._epoch
         for batch in super().__iter__():
             yield batch
+        self._epoch += 1
