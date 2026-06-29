@@ -16,14 +16,10 @@ Run:
 
 import math
 import sys
-import os
 
 import numpy as np
 import torch
 import torchaudio
-
-# Ensure the project root is on sys.path so we can import atdataset
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from atdataset.feature import Fbank, KaldiFbank, WhisperFbank
 

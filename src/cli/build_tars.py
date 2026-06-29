@@ -941,7 +941,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     """Parse top-level ``atdataset`` arguments or direct build arguments."""
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] in ("build", "gen_lst"):
-        from atdataset.gen_lst import add_gen_lst_args
+        from cli.gen_lst import add_gen_lst_args
 
         parser = argparse.ArgumentParser(prog="atdataset")
         subparsers = parser.add_subparsers(dest="command", required=True)
@@ -970,7 +970,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if command == "build":
         build(args)
     elif command == "gen_lst":
-        from atdataset.gen_lst import generate_lst
+        from cli.gen_lst import generate_lst
 
         generate_lst(args)
     else:

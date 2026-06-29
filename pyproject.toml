@@ -16,6 +16,7 @@ dependencies = [
   "webdataset>=0.2.86",
   "soundfile>=0.13",
   "numpy>=1.21",
+  "tqdm>=4.60",
 ]
 classifiers = [
   "License :: OSI Approved :: Apache Software License",
@@ -29,14 +30,31 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+test = ["pytest>=7.0"]
+
 [project.scripts]
-atdataset = "atdataset.build_tars:main"
+atdataset = "cli.build_tars:main"
+
+[project.urls]
+Repository = "https://github.com/pkufool/ATdataset"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["atdataset"]
+where = ["src"]
+include = ["atdataset", "atdataset.*", "cli", "cli.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
 
 [tool.black]
 line-length = 88
