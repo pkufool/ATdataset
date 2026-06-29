@@ -1,5 +1,8 @@
 # ATdataset
-Audio text dataset for pytorch training based on webdataset.
+
+A streaming audio-text dataloader for PyTorch training, built on [WebDataset](https://github.com/webdataset/webdataset).
+
+Designed for large-scale speech recognition training with multi-dataset muxing, dynamic batching, bucketing, and on-the-fly augmentation.
 
 ## Install
 
@@ -7,82 +10,55 @@ Audio text dataset for pytorch training based on webdataset.
 pip install atdataset
 ```
 
-## Usage
-
-see examples/example.py for more details.
-
-## Command line tools
-
-After installation, the package provides an `atdataset` command with two
-subcommands:
-
-- `atdataset build`: build WebDataset tar shards and per-shard JSONL manifests
-  from a TSV input manifest.
-- `atdataset gen_lst`: generate the list file consumed by `ATDataset` /
-  `ATDataloader` from existing tar shards and JSONL manifests.
-
-### Generate a tar list with `atdataset gen_lst`
-
-`gen_lst` scans tar shards, finds the matching transcript manifest for each tar,
-and writes one list entry per shard.
+For development:
 
 ```bash
-atdataset gen_lst \
-  --audio-pattern 'data/tars/audios/*.tar' \
-  --txt-dir data/tars/manifests \
-  --output data/tars/data.lst
+git clone https://github.com/pkufool/ATdataset.git
+cd ATdataset
+pip install -e ".[dev]"
 ```
 
-Output format:
+## Quick Start
 
-```text
-/abs/path/to/shard.tar /abs/path/to/shard.jsonl duration_hours num_samples
+```python
+from atdataset import ATDataloader
+
+dl = ATDataloader(
+    datasets="data/tars/train.lst",
+    sample_rate=16000,
+    max_duration=600.0,
+)
+
+for batch in dl:
+    audio = batch["audio"]          # (B, T), padded
+    audio_lens = batch["audio_lens"]  # (B,)
+    feature = batch["feature"]      # (B, T, F), padded
+    feature_lens = batch["feature_lens"]  # (B,)
+    texts = batch["text"]           # list of str
+    break
 ```
 
-Column meanings:
+## CLI Tools
 
-1. absolute path to the audio tar shard;
-2. absolute path to the matching transcript manifest (`.json` or `.jsonl`);
-3. total duration of the shard in hours, computed from the manifest `duration`
-   fields;
-4. number of valid JSON samples in the manifest.
-
-Matching rules:
-
-1. `--audio-pattern` is expanded as a Python glob. Quote the pattern in the
-   shell, for example `'data/tars/audios/*.tar'`.
-2. The shard key is the tar basename without `.tar` or `.tar.gz`.
-   For example, `data/tars/audios/train.000000.tar` maps to key
-   `train.000000`.
-3. The transcript manifest is searched under `--txt-dir` as `<key>.json` first,
-   then `<key>.jsonl`.
-4. If audio tar keys and manifest keys use different prefixes, replace the
-   prefix with `--audio-prefix` and `--txt-prefix`:
+After installation, the `atdataset` command provides two subcommands:
 
 ```bash
-atdataset gen_lst \
-  --audio-pattern 'data/tars/audios/audio.*.tar' \
-  --txt-dir data/tars/manifests \
-  --output data/tars/data.lst \
-  --audio-prefix audio \
-  --txt-prefix text
+# Build tar shards from a TSV manifest
+atdataset build --input train.tsv --output-dir data/tars --num-tars 64
+
+# Generate a .lst file from existing tar shards
+atdataset gen_lst --audio-pattern 'data/tars/audios/*.tar' \
+    --txt-dir data/tars/manifests --output data/tars/train.lst
 ```
 
-By default, missing manifests or prefix mismatches are reported as warnings and
-skipped. Use `--strict` to fail immediately:
+Run `atdataset build --help` or `atdataset gen_lst --help` for full option details.
 
-```bash
-atdataset gen_lst \
-  --audio-pattern 'data/tars/audios/*.tar' \
-  --txt-dir data/tars/manifests \
-  --output data/tars/data.lst \
-  --strict
-```
+## Documentation
 
-Useful options:
+- [Design & Architecture](docs/design.md) — pipeline architecture, bucketing, muxing, epoch control
+- [Usage Guide](docs/usage.md) — detailed examples for all features
+- [Data Format](docs/data_format.md) — manifest, tar shard, and lst file formats
 
-- `--no-sort`: keep the raw glob order instead of sorting tar paths.
-- `--audio-prefix` / `--txt-prefix`: map tar shard names to differently named
-  transcript manifests.
-- `--strict`: raise an error instead of warning/skipping when a match is missing.
+## License
 
+Apache-2.0
