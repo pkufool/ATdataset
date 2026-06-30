@@ -863,6 +863,25 @@ class StreamingBucketBatcher:
         weights = self.weights
 
         if self.mux_intra_batch:
+            # NOTE on per-batch dataset ratio:
+            # With mux_intra_batch=True, samples are drawn from streams according
+            # to `weights` and placed into shared buckets by duration. A batch is
+            # assembled from a single bucket via FIFO. This means the per-batch
+            # dataset ratio depends on the duration overlap between datasets — if
+            # datasets have different length distributions, some buckets will be
+            # dominated by one dataset.
+            #
+            # Alternative designs considered and rejected:
+            # - Per-dataset independent buckets: would allow exact per-batch ratio
+            #   control, but causes memory blowup when dataset×bucket combinations
+            #   are sparse — slow-draining buckets block others and accumulate
+            #   unboundedly.
+            # - Per-sample rebalancing at batch assembly: requires O(n) scanning
+            #   of the bucket deque, too expensive for large buckets.
+            #
+            # The current design guarantees correct global ratio (over the full
+            # epoch) and is a deliberate trade-off favoring bounded memory and
+            # O(1) batch assembly over strict per-batch ratio adherence.
             buckets = collections.defaultdict(collections.deque)
         else:
             buckets = [
@@ -1015,7 +1034,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
         num_copies: int = 1,
         is_test: bool = False,
         num_buckets: int = 30,
-        fill_factor: float = 1.2,
+        fill_factor: float = 1.15,
     ):
         """
         Batched dataset that combines multiple ATDatasets with streaming bucketing and optional intra-batch muxing.
@@ -1051,7 +1070,7 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             Correction factor for epoch batch count estimation. Batches are
             typically not fully packed to max_duration due to bucketing
             constraints, so the actual number of batches per epoch is higher
-            than the naive estimate. Default is 1.2 (i.e. ~83% average fill).
+            than the naive estimate. Default is 1.15 (i.e. ~87% average fill).
             Use examples/example.py to measure the true value for your data.
         """
         super().__init__()
@@ -1297,10 +1316,10 @@ class ATDataloader(wds.WebLoader):
         num_workers: int = 4,
         worker_init_fn: Optional[Callable] = None,
         prefetch_factor: int = 2,
-        seed: Optional[int] = None,
+        seed: Optional[int] = 1015,
         mux_intra_batch: bool = True,
         num_buckets: int = 30,
-        fill_factor: float = 1.2,
+        fill_factor: float = 1.15,
         is_test: bool = False,
     ):
         """
@@ -1383,7 +1402,7 @@ class ATDataloader(wds.WebLoader):
             fill_factor:
                 Correction factor for epoch batch count estimation. Due to
                 bucketing constraints, batches are typically not fully packed.
-                Default 1.2 means ~83% average fill. Measure the true value
+                Default 1.15 means ~87% average fill. Measure the true value
                 with examples/example.py and adjust accordingly.
             is_test:
                 Whether the dataloader is for testing or not, for training and validation, set is_test to False

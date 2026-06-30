@@ -167,7 +167,7 @@ dl = ATDataloader(
 
 The `fill_factor` parameter controls epoch length estimation accuracy. Due to bucketing, batches are typically not fully packed to `max_duration`.
 
-Default is `1.2` (assumes ~83% average fill). To measure your actual fill factor:
+Default is `1.15` (assumes ~87% average fill). To measure your actual fill factor:
 
 ```bash
 python examples/example.py \

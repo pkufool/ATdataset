@@ -859,13 +859,11 @@ def build(args) -> Dict:
         name = input_path.name
         args.tar_prefix = Path(name[:-3]).stem if name.endswith(".gz") else input_path.stem
 
+    args.input = str(input_path.resolve())
+
     tmp_name = args.tmp_dir if args.tmp_dir else args.input.replace("/", "__")
     tmp_root = Path.home() / ".atdataset" / tmp_name
     tmp_root.mkdir(parents=True, exist_ok=True)
-
-    # Normalize after computing the default tmp name so resume paths stay stable
-    # for the user-provided manifest string.
-    args.input = str(input_path.resolve())
 
     config = BuildConfig(
         input=args.input,
@@ -940,19 +938,26 @@ def build(args) -> Dict:
 def parse_args(argv: Optional[Sequence[str]] = None):
     """Parse top-level ``atdataset`` arguments or direct build arguments."""
     argv = sys.argv[1:] if argv is None else list(argv)
-    if argv and argv[0] in ("build", "gen_lst"):
+
+    # When invoked with a subcommand or no arguments (--help), show the
+    # top-level help listing both subcommands.
+    if not argv or argv[0] in ("build", "gen_lst", "-h", "--help"):
         from cli.gen_lst import add_gen_lst_args
 
-        parser = argparse.ArgumentParser(prog="atdataset")
-        subparsers = parser.add_subparsers(dest="command", required=True)
-        add_build_args(subparsers.add_parser("build", help="Build tar shards."))
-        add_gen_lst_args(
-            subparsers.add_parser(
-                "gen_lst",
-                help="Generate a tar/manifest list file.",
-                formatter_class=argparse.RawDescriptionHelpFormatter,
-            )
+        parser = argparse.ArgumentParser(
+            prog="atdataset",
+            description="ATdataset command line tools for building and managing WebDataset shards.",
         )
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        add_build_args(subparsers.add_parser(
+            "build",
+            help="Build WebDataset tar shards from a TSV manifest.",
+        ))
+        add_gen_lst_args(subparsers.add_parser(
+            "gen_lst",
+            help="Generate a tar/manifest list file from existing shards.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        ))
         return parser.parse_args(argv)
 
     # Direct invocation compatibility: python build_tars.py --input ...

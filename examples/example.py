@@ -216,6 +216,11 @@ def get_args():
         help="Run in test mode (no shuffling, no augmentation).",
     )
 
+    parser.add_argument(
+        "--print-ids", action="store_true", default=False,
+        help="Print sample IDs for each batch.",
+    )
+
     return parser.parse_args()
 
 
@@ -260,7 +265,8 @@ def main():
     total_batch_duration = 0.0
     num_batches = 0
     for i, batch in enumerate(tqdm(dl, total=len(dl))):
-        logging.info(f"Batch {i}: ids={batch['ids']}")
+        if args.print_ids:
+            logging.info(f"Batch {i}: ids={batch['ids']}")
         # Measure actual batch duration for fill_factor estimation
         if "audio" in batch and "audio_lens" in batch:
             batch_dur = batch["audio_lens"].sum().item() / args.sample_rate
