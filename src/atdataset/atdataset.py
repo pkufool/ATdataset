@@ -1288,6 +1288,27 @@ class BatchedDataset(torch.utils.data.IterableDataset):
             yield batch_output
 
 
+class _WorkerInitFn:
+    """Picklable worker-init callable used by ATDataloader.
+    """
+
+    def __init__(
+        self,
+        seed: int,
+        epoch_ref: List[int],
+        user_init: Optional[Callable] = None,
+    ):
+        self.seed = seed
+        self.epoch_ref = epoch_ref
+        self.user_init = user_init
+
+    def __call__(self, worker_id: int) -> None:
+        worker_seed = self.seed + worker_id + self.epoch_ref[0] * 10000
+        fix_random_seed(worker_seed)
+        if self.user_init is not None:
+            self.user_init(worker_id)
+
+
 class ATDataloader(wds.WebLoader):
     def __init__(
         self,
@@ -1509,20 +1530,16 @@ class ATDataloader(wds.WebLoader):
         if seed is not None:
             fix_random_seed(seed)
 
-            _user_init = worker_init_fn
-            _seed = seed
-            # Use a mutable container so the closure captures the current epoch
+            # Use a mutable container so the callable captures the current epoch
             # at iteration time rather than at construction time.
             _epoch_ref = [0]
             self._epoch_ref = _epoch_ref
 
-            def _worker_init_fn(worker_id: int):
-                worker_seed = _seed + worker_id + _epoch_ref[0] * 10000
-                fix_random_seed(worker_seed)
-                if _user_init is not None:
-                    _user_init(worker_id)
-
-            worker_init_fn = _worker_init_fn
+            worker_init_fn = _WorkerInitFn(
+                seed=seed,
+                epoch_ref=_epoch_ref,
+                user_init=worker_init_fn,
+            )
         else:
             self._epoch_ref = None
 
