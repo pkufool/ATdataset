@@ -704,12 +704,21 @@ def write_one_tar(task: Dict) -> Dict:
 
 
 def write_tars_parallel(args, plan: SplitPlan) -> List[Dict]:
-    """Generate all tar shards, optionally using multiple worker processes."""
+    """Generate tar shards, optionally using multiple worker processes.
+
+    When ``--split-start`` / ``--split-end`` are set, only the corresponding
+    subset of shard indices is processed, enabling distributed builds across
+    multiple machines.
+    """
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audios"
     manifest_dir = output_dir / "manifests"
+    split_start = getattr(args, "split_start", None) or 0
+    split_end = getattr(args, "split_end", None) or len(plan.split_files)
     tasks = []
     for index, split_file in enumerate(plan.split_files):
+        if index < split_start or index >= split_end:
+            continue
         prefix = f"{args.tar_prefix}.{index:0{args.split_bits}d}"
         tasks.append(
             {
@@ -856,6 +865,28 @@ def add_build_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=False,
         help="Do not write output-dir/data.lst.",
     )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Only create the split plan and intermediate files without building "
+            "tar shards. Useful for distributed builds: run --plan-only first, "
+            "then run with --split-start/--split-end on each machine."
+        ),
+    )
+    parser.add_argument(
+        "--split-start",
+        type=int,
+        default=None,
+        help="Start index of tar shards to build (inclusive).",
+    )
+    parser.add_argument(
+        "--split-end",
+        type=int,
+        default=None,
+        help="End index of tar shards to build (exclusive).",
+    )
     return parser
 
 
@@ -909,6 +940,17 @@ def build(args) -> Dict:
     plan = create_split_plan(args, tmp_root)
     context["split_plan"] = asdict(plan)
     atomic_write_json(context_path, context)
+
+    if args.plan_only:
+        print(f"Plan created: {plan.num_tars} shards, {plan.total_samples} samples.")
+        print(f"Split files saved under: {tmp_root}")
+        return {
+            "tmp_dir": str(tmp_root),
+            "output_dir": args.output_dir,
+            "num_tars": plan.num_tars,
+            "total_input_samples": plan.total_samples,
+            "plan_only": True,
+        }
 
     results = write_tars_parallel(args, plan)
     lst_path = None if args.no_lst else write_dataset_list(args.output_dir, results)

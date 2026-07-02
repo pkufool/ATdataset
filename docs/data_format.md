@@ -124,3 +124,24 @@ atdataset build \
 The generated `data.lst` is ready to use directly with `ATDataloader`.
 
 Run `atdataset build --help` for full option details.
+
+## Distributed Build
+
+For very large datasets, you can split the tar building across multiple machines:
+
+```bash
+# Step 1: Create the split plan (no tar building)
+atdataset build --input train.tsv --output-dir data/tars --num-tars 64 --plan-only
+
+# Step 2: Copy the split files to all machines, then build in parallel (It's better that all the machines share the same HOME)
+# Machine 1:
+atdataset build --input train.tsv --output-dir data/tars --split-start 0 --split-end 32
+# Machine 2:
+atdataset build --input train.tsv --output-dir data/tars --split-start 32 --split-end 64
+
+# Step 3: Generate the list file after all machines finish
+atdataset gen_lst --audio-pattern 'data/tars/audios/*.tar' \
+    --txt-dir data/tars/manifests --output data/tars/data.lst
+```
+
+All machines must use the same `--input`, `--output-dir`, `--num-tars` (or other split parameters) so the split plan is consistent.
