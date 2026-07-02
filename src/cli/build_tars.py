@@ -638,6 +638,7 @@ def write_one_tar(task: Dict) -> Dict:
     samples = 0
     total_duration = 0.0
     errors = 0
+    seen_keys = set()
     with tarfile.open(tmp_tar, "w", encoding="utf-8") as audio_tar, open(
         tmp_manifest, "w", encoding="utf-8"
     ) as txt_jsonl, open(split_file, "r", encoding="utf-8") as f:
@@ -646,6 +647,16 @@ def write_one_tar(task: Dict) -> Dict:
                 continue
             item = json.loads(line)
             seg_id = item["id"]
+            filename = f"{seg_id}.{fmt.lower()}"
+            if filename in seen_keys:
+                print(
+                    f"Warning: duplicate key '{filename}' in {split_file}:{line_no}, "
+                    f"skipping.",
+                    flush=True,
+                )
+                continue
+            seen_keys.add(filename)
+
             try:
                 segment, sr = load_audio_segment(item, sample_rate=sample_rate)
                 duration = float(segment.shape[1]) / float(sr)
@@ -659,7 +670,6 @@ def write_one_tar(task: Dict) -> Dict:
                 )
                 continue
 
-            filename = f"{seg_id}.{fmt.lower()}"
             info = tarfile.TarInfo(name=filename)
             info.size = len(audio_bytes)
             audio_tar.addfile(info, io.BytesIO(audio_bytes))
